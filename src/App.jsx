@@ -1,42 +1,42 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
-const DEFAULT_ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  {
-    urls: [
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp',
-      'turns:openrelay.metered.ca:443?transport=tcp'
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  }
-];
-
-const RES_MAP = {
-  '720p': { width: 1280, height: 720, minBitrate: 4000, startBitrate: 8000, maxBitrate: 12000000, label: '720p' },
-  '1080p': { width: 1920, height: 1080, minBitrate: 8000, startBitrate: 12000, maxBitrate: 20000000, label: '1080p' },
-  '1440p': { width: 2560, height: 1440, minBitrate: 12000, startBitrate: 18000, maxBitrate: 30000000, label: '2K (1440p)' }
+const RES_CONFIG = {
+  '720p': { width: 1280, height: 720, bitrate: 3500000, label: '720p' },
+  '1080p': { width: 1920, height: 1080, bitrate: 6000000, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, bitrate: 9000000, label: '2K (1440p)' }
 };
 
-// Injeta parâmetros de alto bitrate e 60fps direto no SDP (técnica VDO.Ninja / Parsec)
-function boostSdpBitrate(sdp, cfg, targetFps) {
-  if (!sdp) return sdp;
-  const maxKbps = Math.round(cfg.maxBitrate / 1000);
-  let modified = sdp.replace(
-    /(m=video.*\r\n)/g,
-    `$1b=AS:${maxKbps}\r\nb=TIAS:${cfg.maxBitrate}\r\na=framerate:${targetFps}\r\n`
-  );
-  // Injeta x-google-min-bitrate e start-bitrate em todos os payloads de vídeo para impedir queda para 15fps
-  modified = modified.replace(
-    /(a=fmtp:\d+ .*)/g,
-    `$1;x-google-min-bitrate=${cfg.minBitrate};x-google-start-bitrate=${cfg.startBitrate};x-google-max-bitrate=${maxKbps}`
-  );
-  return modified;
+async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
+  const w = Math.max(2, Math.floor(width / 2) * 2);
+  const h = Math.max(2, Math.floor(height / 2) * 2);
+
+  const candidates = [
+    preferredCodec === 'H264' ? { codec: 'avc1.640033', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'VP9' ? { codec: 'vp09.00.10.08' } : null,
+    preferredCodec === 'AV1' ? { codec: 'av01.0.08M.08' } : null,
+    { codec: 'vp8' },
+    { codec: 'avc1.42002a', avc: { format: 'annexb' } }
+  ].filter(Boolean);
+
+  for (const cand of candidates) {
+    for (const hw of ['prefer-hardware', 'no-preference']) {
+      try {
+        const cfg = {
+          ...cand,
+          width: w,
+          height: h,
+          bitrate,
+          framerate: fps,
+          latencyMode: 'realtime',
+          hardwareAcceleration: hw
+        };
+        const res = await VideoEncoder.isConfigSupported(cfg);
+        if (res.supported) return cfg;
+      } catch (e) {}
+    }
+  }
+  return { codec: 'vp8', width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
 }
 
 export default function App() {
@@ -44,21 +44,18 @@ export default function App() {
   const [nickname, setNickname] = useState(() => localStorage.getItem('tl_nick') || 'gosadinhas');
   const [roomName, setRoomName] = useState('squad-brasil');
 
-  // Por padrão já inicia em Fluidez Máxima (motion + maintain-framerate) para destravar 60 FPS no Chrome!
-  const [quality, setQuality] = useState('1440p');
+  const [quality, setQuality] = useState('1080p');
   const [sharpness, setSharpness] = useState('motion');
   const [fps, setFps] = useState(60);
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
-  const [showIpv6Modal, setShowIpv6Modal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
   const [smoothness, setSmoothness] = useState('responsive');
-  const [codec, setCodec] = useState('H264');
-  const [clipConfig, setClipConfig] = useState('off'); // Desligado por padrão para 0% uso extra de GPU (pode ligar nas configs)
+  const [codec, setCodec] = useState('VP8');
+  const [clipConfig, setClipConfig] = useState('720p');
   const [clipDuration, setClipDuration] = useState(30);
-  const [connPolicy, setConnPolicy] = useState('auto');
 
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
@@ -68,19 +65,29 @@ export default function App() {
   ]);
   const [chatInput, setChatInput] = useState('');
   const [logs, setLogs] = useState([]);
-  const [ipv6Diag, setIpv6Diag] = useState({ running: false, hasIpv6: false, candidates: [] });
 
   const socketRef = useRef(null);
-  const pcsRef = useRef({});
-  const pendingCandidatesRef = useRef({});
-  const participantsRef = useRef([]);
-  const localStreamsRef = useRef([]);
+  const activeEncodersRef = useRef({}); // streamId -> { stop(), forceKey() }
+  const videoChunkHandlersRef = useRef({}); // streamId -> fn(meta, buffer)
+  const audioChunkHandlersRef = useRef({}); // streamId -> fn(meta, buffer)
+  const clipRecordersRef = useRef({});
   const clipChunksRef = useRef({});
-  const recordersRef = useRef({});
+
+  const qualityRef = useRef(quality);
+  const fpsRef = useRef(fps);
+  const codecRef = useRef(codec);
+
+  useEffect(() => {
+    qualityRef.current = quality;
+    fpsRef.current = fps;
+    codecRef.current = codec;
+    // Aplica reconfiguração dinâmica se já estiver transmitindo
+    Object.values(activeEncodersRef.current).forEach(enc => enc.reconfigure?.());
+  }, [quality, fps, codec]);
 
   const addLog = (msg) => {
     const time = new Date().toLocaleTimeString('pt-BR');
-    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 140)]);
+    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
   };
 
   useEffect(() => {
@@ -92,67 +99,6 @@ export default function App() {
     localStorage.setItem('tl_nick', nickname);
   }, [nickname]);
 
-  // Aplica mudanças de Resolução, FPS e Prioridade de Fluidez em tempo real na placa de vídeo
-  useEffect(() => {
-    const targetCfg = RES_MAP[quality] || RES_MAP['1440p'];
-    const targetFps = Number(fps);
-    // CRÍTICO: "detail" no Chrome trava o WebRTC em 5-15 FPS! Só usamos "detail" se o usuário forçar manualmente e sem Modo Jogo
-    const effectiveHint = gameMode ? 'motion' : sharpness;
-    const degPref = effectiveHint === 'motion' ? 'maintain-framerate' : 'balanced';
-
-    localStreamsRef.current.forEach(async (ls) => {
-      const vTrack = ls.stream.getVideoTracks()[0];
-      if (!vTrack) return;
-
-      try {
-        if ('contentHint' in vTrack) {
-          vTrack.contentHint = effectiveHint;
-        }
-        await vTrack.applyConstraints({
-          width: { ideal: targetCfg.width, max: 3840 },
-          height: { ideal: targetCfg.height, max: 2160 },
-          frameRate: { min: targetFps, ideal: targetFps, max: 60 }
-        });
-      } catch (e) {
-        // Caso o monitor físico não suporte min: targetFps estrito, aplica ideal
-        await vTrack.applyConstraints({
-          width: { ideal: targetCfg.width },
-          height: { ideal: targetCfg.height },
-          frameRate: { ideal: targetFps, max: 60 }
-        }).catch(() => {});
-      }
-
-      const settings = vTrack.getSettings ? vTrack.getSettings() : {};
-      const actualLabel = settings.height ? `${settings.height}p` : targetCfg.label;
-      ls.res = actualLabel;
-      ls.fps = targetFps;
-
-      Object.entries(pcsRef.current).forEach(([key, pc]) => {
-        if (key.endsWith(ls.id)) {
-          pc.getSenders().forEach(sender => {
-            if (sender.track && sender.track.kind === 'video') {
-              try {
-                const params = sender.getParameters();
-                if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-                params.encodings[0].maxBitrate = targetCfg.maxBitrate;
-                params.encodings[0].maxFramerate = targetFps;
-                params.encodings[0].scaleResolutionDownBy = 1.0;
-                params.encodings[0].priority = 'high';
-                params.encodings[0].networkPriority = 'high';
-                params.degradationPreference = degPref;
-                sender.setParameters(params).catch(() => {});
-              } catch (e) {}
-            }
-          });
-        }
-      });
-
-      setStreams(prev => prev.map(s => s.id === ls.id ? { ...s, res: actualLabel, fps: targetFps } : s));
-      socketRef.current?.emit('stream-meta-update', { streamId: ls.id, res: actualLabel, fps: targetFps });
-      addLog(`Encoder ajustado: ${actualLabel} @ ${targetFps} FPS (Hint: ${effectiveHint}, Pref: ${degPref})`);
-    });
-  }, [quality, fps, sharpness, gameMode]);
-
   useEffect(() => {
     if (!inRoom) return;
 
@@ -160,96 +106,85 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      addLog(`Conectado ao servidor (ID: ${socket.id})`);
+      addLog(`Conectado ao servidor de baixa latência (ID: ${socket.id})`);
       socket.emit('join-room', { roomName, nickname });
-      setTimeout(() => socket.emit('request-streams'), 500);
     });
 
-    socket.on('room-users', (usersList) => {
-      participantsRef.current = usersList;
-      setParticipants(usersList);
-    });
+    socket.on('room-users', (list) => setParticipants(list));
 
-    socket.on('user-joined', ({ id, nick }) => {
-      if (id === socket.id) return;
-      localStreamsRef.current.forEach(ls => {
-        createOfferForPeer(id, ls);
+    socket.on('active-streams', (list) => {
+      list.forEach(st => {
+        if (st.senderId === socket.id) return;
+        setStreams(prev => prev.some(s => s.id === st.streamId) ? prev : [
+          ...prev,
+          {
+            id: st.streamId,
+            owner: st.owner,
+            type: st.type,
+            res: st.res,
+            fps: st.fps,
+            muted: false,
+            minimized: false,
+            isLocal: false
+          }
+        ]);
       });
     });
 
-    socket.on('stream-meta-update', ({ streamId, res, fps: newFps }) => {
-      setStreams(prev => prev.map(s => s.id === streamId ? { ...s, res, fps: newFps } : s));
-    });
-
-    socket.on('webrtc-signal', async ({ senderId, signal, streamMeta }) => {
-      if (!streamMeta?.streamId) return;
-      const key = `${senderId}_${streamMeta.streamId}`;
-      const targetCfg = RES_MAP[quality] || RES_MAP['1440p'];
-
-      try {
-        if (signal.type === 'offer') {
-          const pc = createPeerConnection(senderId, streamMeta);
-          pcsRef.current[key] = pc;
-
-          await pc.setRemoteDescription(new RTCSessionDescription(signal));
-
-          const queued = pendingCandidatesRef.current[key] || [];
-          for (const cand of queued) {
-            await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-          }
-          pendingCandidatesRef.current[key] = [];
-
-          const answer = await pc.createAnswer();
-          answer.sdp = boostSdpBitrate(answer.sdp, targetCfg, streamMeta.fps || 60);
-          await pc.setLocalDescription(answer);
-
-          socket.emit('webrtc-signal', {
-            targetId: senderId,
-            signal: pc.localDescription,
-            streamMeta
-          });
-        } else if (signal.type === 'answer') {
-          const pc = pcsRef.current[key];
-          if (pc && pc.signalingState === 'have-local-offer') {
-            await pc.setRemoteDescription(new RTCSessionDescription(signal));
-            const queued = pendingCandidatesRef.current[key] || [];
-            for (const cand of queued) {
-              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-            }
-            pendingCandidatesRef.current[key] = [];
-            addLog(`Stream WebRTC 60FPS conectado diretamente na GPU!`);
-          }
-        } else if (signal.candidate) {
-          const pc = pcsRef.current[key];
-          if (pc && pc.remoteDescription && pc.remoteDescription.type) {
-            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate)).catch(() => {});
-          } else {
-            if (!pendingCandidatesRef.current[key]) pendingCandidatesRef.current[key] = [];
-            pendingCandidatesRef.current[key].push(signal.candidate);
-          }
+    socket.on('stream-started', (st) => {
+      if (st.senderId === socket.id) return;
+      addLog(`${st.owner} iniciou transmissão (${st.res} @ ${st.fps} FPS)`);
+      setStreams(prev => prev.some(s => s.id === st.streamId) ? prev : [
+        ...prev,
+        {
+          id: st.streamId,
+          owner: st.owner,
+          type: st.type,
+          res: st.res,
+          fps: st.fps,
+          muted: false,
+          minimized: false,
+          isLocal: false
         }
-      } catch (err) {
-        addLog(`Erro WebRTC: ${err.message}`);
-      }
+      ]);
+      socket.emit('request-keyframe', { streamId: st.streamId });
     });
 
-    socket.on('peer-stopped-stream', ({ senderId, streamId }) => {
-      const key = `${senderId}_${streamId}`;
-      if (pcsRef.current[key]) {
-        pcsRef.current[key].close();
-        delete pcsRef.current[key];
-      }
+    socket.on('force-keyframe', () => {
+      Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+    });
+
+    socket.on('v-chunk', (meta, buffer) => {
+      // Se o card do stream ainda não existir (ex: entrou no meio), cria automaticamente
+      setStreams(prev => {
+        if (prev.some(s => s.id === meta.id)) return prev;
+        return [
+          ...prev,
+          {
+            id: meta.id,
+            owner: meta.owner || 'Participante',
+            type: 'Tela',
+            res: `${meta.h}p`,
+            fps: meta.fps || 60,
+            muted: false,
+            minimized: false,
+            isLocal: false
+          }
+        ];
+      });
+      const handler = videoChunkHandlersRef.current[meta.id];
+      if (handler) handler(meta, buffer);
+    });
+
+    socket.on('a-chunk', (meta, buffer) => {
+      const handler = audioChunkHandlersRef.current[meta.id];
+      if (handler) handler(meta, buffer);
+    });
+
+    socket.on('peer-stopped-stream', ({ streamId }) => {
       setStreams(prev => prev.filter(s => s.id !== streamId));
-    });
-
-    socket.on('user-left', ({ id }) => {
-      Object.keys(pcsRef.current).forEach(k => {
-        if (k.startsWith(id)) {
-          pcsRef.current[k].close();
-          delete pcsRef.current[k];
-        }
-      });
-      setStreams(prev => prev.filter(s => s.peerId !== id));
+      delete videoChunkHandlersRef.current[streamId];
+      delete audioChunkHandlersRef.current[streamId];
     });
 
     socket.on('chat-message', (msg) => {
@@ -257,223 +192,161 @@ export default function App() {
     });
 
     return () => {
-      localStreamsRef.current.forEach(s => s.stream.getTracks().forEach(t => t.stop()));
-      Object.values(pcsRef.current).forEach(pc => pc.close());
+      Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
       socket.disconnect();
     };
   }, [inRoom, roomName, nickname]);
 
-  const applyHardwareCodecPreference = (pc) => {
-    try {
-      if (!RTCRtpSender.getCapabilities) return;
-      const caps = RTCRtpSender.getCapabilities('video');
-      if (!caps || !caps.codecs) return;
+  // Motor WebCodecs GPU Sender (Não perde FPS em Alt+Tab nos jogos!)
+  const startWebCodecsSender = async (streamId, mediaStream, streamType) => {
+    const vTrack = mediaStream.getVideoTracks()[0];
+    if (!vTrack) return;
 
-      // Prioriza H.264 (NVENC nas placas NVIDIA RTX) ou VP8 para atingir 60fps reais sem gargalo de CPU
-      const targetMime = codec === 'AV1' ? 'video/av1' : codec === 'VP9' ? 'video/vp9' : 'video/h264';
-      const preferred = caps.codecs.filter(c => c.mimeType.toLowerCase() === targetMime);
-      const vp8Fallback = caps.codecs.filter(c => c.mimeType.toLowerCase() === 'video/vp8');
-      const rest = caps.codecs.filter(c => c.mimeType.toLowerCase() !== targetMime && c.mimeType.toLowerCase() !== 'video/vp8');
+    let running = true;
+    let forceKey = true;
+    let frameCount = 0;
+    let currentCodecStr = 'vp8';
+    let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
+    let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
 
-      if (preferred.length > 0) {
-        pc.getTransceivers().forEach(t => {
-          if (t.setCodecPreferences) {
-            t.setCodecPreferences([...preferred, ...vp8Fallback, ...rest]);
-          }
-        });
-      }
-    } catch (e) {}
-  };
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, metadata) => {
+        if (!running) return;
+        const buf = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(buf);
 
-  const createPeerConnection = (peerId, streamMeta) => {
-    const key = `${peerId}_${streamMeta.streamId}`;
-    if (pcsRef.current[key]) {
-      pcsRef.current[key].close();
-    }
-
-    const pc = new RTCPeerConnection({
-      iceServers: DEFAULT_ICE_SERVERS,
-      iceTransportPolicy: connPolicy === 'turn' ? 'relay' : 'all',
-      bundlePolicy: 'max-bundle',
-      iceCandidatePoolSize: 10
+        socketRef.current?.emit('v-chunk', {
+          id: streamId,
+          owner: nickname,
+          c: currentCodecStr,
+          t: chunk.type,
+          ts: chunk.timestamp,
+          w: targetW,
+          h: targetH,
+          fps: fpsRef.current
+        }, buf.buffer);
+      },
+      error: (err) => addLog(`Aviso GPU Encoder: ${err.message}`)
     });
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socketRef.current?.emit('webrtc-signal', {
-          targetId: peerId,
-          signal: { candidate: event.candidate },
-          streamMeta
-        });
+    const configureEncoderNow = async (rawW, rawH) => {
+      const cfg = RES_CONFIG[qualityRef.current] || RES_CONFIG['1080p'];
+      const targetFps = Number(fpsRef.current) || 60;
+      // Mantém a proporção real da tela capturada limitada à qualidade escolhida
+      const ratio = rawW && rawH ? rawW / rawH : 16 / 9;
+      targetH = Math.min(cfg.height, rawH || cfg.height);
+      targetW = Math.round(targetH * ratio);
+
+      const bestCfg = await findSupportedVideoConfig(targetW, targetH, targetFps, cfg.bitrate, codecRef.current);
+      currentCodecStr = bestCfg.codec;
+      targetW = bestCfg.width;
+      targetH = bestCfg.height;
+
+      if (videoEncoder.state !== 'closed') {
+        videoEncoder.configure(bestCfg);
+        forceKey = true;
+        addLog(`GPU Encoder ativo: ${targetW}x${targetH} @ ${targetFps} FPS (${currentCodecStr}, ${(cfg.bitrate/1e6).toFixed(1)} Mbps)`);
       }
     };
 
-    const fallbackRemoteStream = new MediaStream();
+    const settings = vTrack.getSettings ? vTrack.getSettings() : {};
+    await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
-    pc.ontrack = (event) => {
-      fallbackRemoteStream.addTrack(event.track);
-      const activeStream = (event.streams && event.streams[0]) ? event.streams[0] : fallbackRemoteStream;
-
-      // Ajusta o Jitter Buffer do receptor para fluidez imediata (0ms em modo responsivo)
-      if (event.receiver && 'playoutDelayHint' in event.receiver) {
-        event.receiver.playoutDelayHint = smoothness === 'responsive' ? 0.0 : smoothness === 'balanced' ? 0.08 : 0.25;
-      }
-
-      setStreams(prev => {
-        const exists = prev.find(s => s.id === streamMeta.streamId);
-        if (exists) {
-          return prev.map(s => s.id === streamMeta.streamId ? { ...s, stream: activeStream, pc } : s);
-        }
-        const newObj = {
-          id: streamMeta.streamId,
-          peerId,
-          owner: streamMeta.owner,
-          type: streamMeta.type,
-          stream: activeStream,
-          pc,
-          muted: false,
-          minimized: false,
-          fps: streamMeta.fps,
-          res: streamMeta.res,
-          isLocal: false
-        };
-        if (clipConfig !== 'off') {
-          startCircularClipBuffer(streamMeta.streamId, activeStream);
-        }
-        return [...prev, newObj];
-      });
-    };
-
-    return pc;
-  };
-
-  const createOfferForPeer = async (targetPeerId, localStreamObj) => {
-    try {
-      const targetCfg = RES_MAP[quality] || RES_MAP['1440p'];
-      const effectiveHint = gameMode ? 'motion' : sharpness;
-      const degPref = effectiveHint === 'motion' ? 'maintain-framerate' : 'balanced';
-
-      const streamMeta = {
-        streamId: localStreamObj.id,
-        owner: nickname,
-        type: localStreamObj.type,
-        res: localStreamObj.res,
-        fps: localStreamObj.fps
-      };
-      const key = `${targetPeerId}_${localStreamObj.id}`;
-      const pc = createPeerConnection(targetPeerId, streamMeta);
-      pcsRef.current[key] = pc;
-
-      localStreamObj.stream.getTracks().forEach(track => {
-        const sender = pc.addTrack(track, localStreamObj.stream);
-        if (track.kind === 'video') {
-          try {
-            const params = sender.getParameters();
-            if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-            params.encodings[0].maxBitrate = targetCfg.maxBitrate;
-            params.encodings[0].maxFramerate = Number(localStreamObj.fps);
-            params.encodings[0].scaleResolutionDownBy = 1.0;
-            params.encodings[0].priority = 'high';
-            params.encodings[0].networkPriority = 'high';
-            params.degradationPreference = degPref;
-            sender.setParameters(params).catch(() => {});
-          } catch (e) {}
-        }
-      });
-
-      applyHardwareCodecPreference(pc);
-
-      const offer = await pc.createOffer({
-        offerToReceiveVideo: true,
-        offerToReceiveAudio: true
-      });
-      offer.sdp = boostSdpBitrate(offer.sdp, targetCfg, localStreamObj.fps);
-      await pc.setLocalDescription(offer);
-
-      socketRef.current?.emit('webrtc-signal', {
-        targetId: targetPeerId,
-        signal: pc.localDescription,
-        streamMeta
-      });
-    } catch (err) {
-      addLog(`Erro ao criar oferta: ${err.message}`);
-    }
-  };
-
-  const startCircularClipBuffer = (streamId, mediaStream) => {
-    if (clipConfig === 'off' || !mediaStream) return;
-    setTimeout(() => {
+    // Captura de Áudio via WebCodecs Opus (se o usuário compartilhou áudio do jogo/aba)
+    let audioEncoder = null;
+    const aTrack = mediaStream.getAudioTracks()[0];
+    if (aTrack && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window) {
       try {
-        const videoTracks = mediaStream.getVideoTracks();
-        if (!videoTracks.length) return;
-        const videoOnlyStream = new MediaStream([videoTracks[0]]);
-        const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')
-          ? 'video/mp4;codecs=avc1'
-          : 'video/webm';
-
-        const recorder = new MediaRecorder(videoOnlyStream, {
-          mimeType,
-          videoBitsPerSecond: 5000000
+        audioEncoder = new AudioEncoder({
+          output: (chunk) => {
+            if (!running) return;
+            const buf = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(buf);
+            socketRef.current?.emit('a-chunk', {
+              id: streamId,
+              ts: chunk.timestamp,
+              sr: 48000,
+              ch: 2
+            }, buf.buffer);
+          },
+          error: () => {}
         });
-
-        clipChunksRef.current[streamId] = [];
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            const list = clipChunksRef.current[streamId] || [];
-            list.push({ blob: e.data, ts: Date.now() });
-            const cutoff = Date.now() - clipDuration * 1000;
-            if (list.length > 2) {
-              clipChunksRef.current[streamId] = [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)];
-            } else {
-              clipChunksRef.current[streamId] = list;
-            }
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 96000 });
+        const aProc = new MediaStreamTrackProcessor({ track: aTrack });
+        const aReader = aProc.readable.getReader();
+        (async () => {
+          while (running) {
+            const { value: aData, done } = await aReader.read();
+            if (done || !aData) break;
+            if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
+            aData.close();
           }
-        };
-        recorder.start(1000);
-        recordersRef.current[streamId] = { recorder, mimeType };
-      } catch (err) {}
-    }, 1500);
-  };
-
-  const saveClip30s = (streamObj, openReplayOnly = false) => {
-    if (clipConfig === 'off') {
-      alert('Ative a opção "Clipes e replay" nas Configurações (⚙️) para gravar o buffer de 30s.');
-      return;
-    }
-    const chunks = clipChunksRef.current[streamObj.id] || [];
-    if (!chunks.length) {
-      alert('Aguarde alguns segundos de transmissão para acumular os 30s.');
-      return;
-    }
-    const mime = recordersRef.current[streamObj.id]?.mimeType || 'video/webm';
-    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
-    const blob = new Blob(chunks.map(c => c.blob), { type: mime });
-    const url = URL.createObjectURL(blob);
-
-    if (openReplayOnly) {
-      setReplayClipUrl(url);
-      return;
+        })().catch(() => {});
+      } catch (e) {}
     }
 
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Telinha_Clip_${streamObj.owner}_${Date.now()}.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    // Leitura de Frames de Vídeo a 60 FPS Nativos via MediaStreamTrackProcessor (Imune a Alt+Tab throttling!)
+    if ('MediaStreamTrackProcessor' in window) {
+      const processor = new MediaStreamTrackProcessor({ track: vTrack });
+      const reader = processor.readable.getReader();
+
+      (async () => {
+        let lastFrameTime = 0;
+        while (running) {
+          const { value: frame, done } = await reader.read();
+          if (done || !frame) break;
+
+          const now = performance.now();
+          const minInterval = 1000 / (Number(fpsRef.current) + 2);
+
+          // Controle de Backpressure: se a rede do transmissor oscilar, descarta ANTES do encoder para nunca quebrar os P-frames nem gerar atraso!
+          const ws = socketRef.current?.io?.engine?.transport?.ws;
+          const netBusy = ws && ws.bufferedAmount > 450000;
+
+          if (now - lastFrameTime < minInterval || videoEncoder.encodeQueueSize > 2 || netBusy) {
+            frame.close();
+            continue;
+          }
+          lastFrameTime = now;
+
+          try {
+            if (videoEncoder.state === 'configured') {
+              const isKey = forceKey || (frameCount % 90 === 0);
+              forceKey = false;
+              videoEncoder.encode(frame, { keyFrame: isKey });
+              frameCount++;
+            }
+          } catch (e) {
+          } finally {
+            frame.close();
+          }
+        }
+      })().catch(() => {});
+    }
+
+    activeEncodersRef.current[streamId] = {
+      forceKey: () => { forceKey = true; },
+      reconfigure: () => {
+        const st = vTrack.getSettings ? vTrack.getSettings() : {};
+        configureEncoderNow(st.width || 1920, st.height || 1080);
+      },
+      stop: () => {
+        running = false;
+        try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
+        try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch (e) {}
+      }
+    };
   };
 
   const handleShareScreen = async () => {
     try {
-      const targetCfg = RES_MAP[quality] || RES_MAP['1440p'];
+      const cfg = RES_CONFIG[quality] || RES_CONFIG['1080p'];
       const targetFps = Number(fps);
-      const effectiveHint = gameMode ? 'motion' : sharpness;
 
-      // Solicita explicitamente até 2560x1440 (ou 4K) a 60 FPS nativos sem downscale do navegador
       const mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          width: { ideal: targetCfg.width, max: 3840 },
-          height: { ideal: targetCfg.height, max: 2160 },
+          width: { ideal: cfg.width, max: 2560 },
+          height: { ideal: cfg.height, max: 1440 },
           frameRate: { ideal: targetFps, max: 60 },
           cursor: 'always'
         },
@@ -485,43 +358,35 @@ export default function App() {
       });
 
       const vTrack = mediaStream.getVideoTracks()[0];
-      // CRÍTICO: Usar 'motion' destrava o codificador do Chrome de 15fps para 60fps!
       if (vTrack && 'contentHint' in vTrack) {
-        vTrack.contentHint = effectiveHint;
+        vTrack.contentHint = 'motion';
       }
 
-      const settings = vTrack.getSettings ? vTrack.getSettings() : {};
-      const actualResLabel = settings.height ? `${settings.height}p` : targetCfg.label;
-
-      const newId = 'screen_' + Math.random().toString(36).substring(2, 9);
+      const newId = 'stream_' + Math.random().toString(36).substring(2, 9);
       vTrack.onended = () => stopStream(newId);
 
       const newStreamObj = {
         id: newId,
-        peerId: socketRef.current?.id,
         owner: nickname,
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
+        res: cfg.label,
+        fps: targetFps,
         muted: true,
         minimized: false,
-        fps: targetFps,
-        res: actualResLabel,
         isLocal: true
       };
 
-      localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
-      if (clipConfig !== 'off') {
-        startCircularClipBuffer(newId, mediaStream);
-      }
-
-      participantsRef.current.forEach(p => {
-        if (p.id !== socketRef.current?.id) {
-          createOfferForPeer(p.id, newStreamObj);
-        }
+      socketRef.current?.emit('start-stream', {
+        streamId: newId,
+        owner: nickname,
+        type: newStreamObj.type,
+        res: cfg.label,
+        fps: targetFps
       });
 
-      addLog(`Capturando fonte nativa em ${settings.width || targetCfg.width}x${settings.height || targetCfg.height} @ ${targetFps} FPS (Codec: ${codec})`);
+      await startWebCodecsSender(newId, mediaStream, newStreamObj.type);
     } catch (err) {
       addLog(`Compartilhamento cancelado: ${err.message}`);
     }
@@ -530,71 +395,75 @@ export default function App() {
   const handleShareCamera = async () => {
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: Number(fps) } },
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: Number(fps) } },
         audio: false
       });
       const newId = 'cam_' + Math.random().toString(36).substring(2, 9);
       const vTrack = mediaStream.getVideoTracks()[0];
-      if (vTrack && 'contentHint' in vTrack) vTrack.contentHint = 'motion';
       vTrack.onended = () => stopStream(newId);
 
       const newStreamObj = {
         id: newId,
-        peerId: socketRef.current?.id,
         owner: nickname,
         type: 'Câmera',
         stream: mediaStream,
+        res: '720p',
+        fps: Number(fps),
         muted: true,
         minimized: false,
-        fps: Number(fps),
-        res: '1080p',
         isLocal: true
       };
 
-      localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
-
-      participantsRef.current.forEach(p => {
-        if (p.id !== socketRef.current?.id) {
-          createOfferForPeer(p.id, newStreamObj);
-        }
+      socketRef.current?.emit('start-stream', {
+        streamId: newId,
+        owner: nickname,
+        type: 'Câmera',
+        res: '720p',
+        fps: Number(fps)
       });
+
+      await startWebCodecsSender(newId, mediaStream, 'Câmera');
     } catch (err) {
       alert('Não foi possível acessar a webcam.');
     }
   };
 
   const stopStream = (streamId) => {
+    activeEncodersRef.current[streamId]?.stop?.();
+    delete activeEncodersRef.current[streamId];
+
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
-      if (target?.stream && target.isLocal) {
-        target.stream.getTracks().forEach(t => t.stop());
-      }
+      if (target?.stream) target.stream.getTracks().forEach(t => t.stop());
       return prev.filter(s => s.id !== streamId);
     });
-    localStreamsRef.current = localStreamsRef.current.filter(s => s.id !== streamId);
+
     socketRef.current?.emit('stop-stream', { streamId });
     if (expandedId === streamId) setExpandedId(null);
   };
 
-  const runIpv6Diagnostic = async () => {
-    setShowIpv6Modal(true);
-    setIpv6Diag({ running: true, hasIpv6: false, candidates: [] });
-    const pc = new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS });
-    pc.createDataChannel('ipv6_test');
-    const list = [];
-    let v6 = false;
-    pc.onicecandidate = (e) => {
-      if (e.candidate?.candidate) {
-        const c = e.candidate.candidate;
-        list.push(c);
-        if (c.includes(':') && !c.includes('.local')) v6 = true;
-        setIpv6Diag({ running: true, hasIpv6: v6, candidates: [...list] });
-      }
-    };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    setTimeout(() => pc.close(), 3000);
+  const saveClip30s = (streamId, owner, openReplay = false) => {
+    const chunks = clipChunksRef.current[streamId] || [];
+    if (!chunks.length) {
+      alert('Aguarde alguns segundos assistindo para acumular o buffer de 30s.');
+      return;
+    }
+    const mime = clipRecordersRef.current[streamId]?.mimeType || 'video/webm';
+    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(chunks.map(c => c.blob), { type: mime });
+    const url = URL.createObjectURL(blob);
+
+    if (openReplay) {
+      setReplayClipUrl(url);
+      return;
+    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Telinha_Clip_${owner}_${Date.now()}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   const sendChat = (e) => {
@@ -675,19 +544,12 @@ export default function App() {
           <select value={quality} onChange={e => setQuality(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
             <option value="720p">Qualidade: 720p (HD)</option>
             <option value="1080p">Qualidade: 1080p (Full HD)</option>
-            <option value="1440p">Qualidade: 2K (1440p Nativo)</option>
+            <option value="1440p">Qualidade: 2K (1440p)</option>
           </select>
 
-          <select
-            value={sharpness}
-            onChange={e => {
-              setSharpness(e.target.value);
-              if (e.target.value === 'detail') setGameMode(false);
-            }}
-            className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer"
-          >
-            <option value="motion">Fluidez Máxima (60 FPS Cravado)</option>
-            <option value="detail">Nitidez Estática (Texto/Código · reduz FPS)</option>
+          <select value={sharpness} onChange={e => setSharpness(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
+            <option value="motion">Fluidez Máxima (Jogos / Vídeo)</option>
+            <option value="detail">Nitidez (Texto / Código)</option>
           </select>
 
           <select value={fps} onChange={e => setFps(Number(e.target.value))} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
@@ -704,7 +566,6 @@ export default function App() {
             className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer ${
               gameMode ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200' : 'bg-[#171B24] border-[#282E3D] text-gray-200'
             }`}
-            title="Força NVENC Motion + Maintain Framerate para 60 FPS constantes"
           >
             <span>🎮</span> Modo jogo
           </button>
@@ -720,41 +581,26 @@ export default function App() {
             {showSettings && (
               <div className="absolute right-0 mt-2 w-80 bg-[#141820] border border-[#262C3A] rounded-xl shadow-2xl p-4 z-50 text-left space-y-3.5">
                 <div className="flex items-center justify-between border-b border-[#222834] pb-2">
-                  <span className="font-semibold text-sm text-white">Configurações de Performance</span>
+                  <span className="font-semibold text-sm text-white">Configurações</span>
                   <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Latência / Jitter Buffer (para quem assiste)</label>
-                  <select value={smoothness} onChange={e => setSmoothness(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="responsive">Tempo Real (0ms buffer · Mais fluido)</option>
-                    <option value="balanced">Equilibrado (80ms buffer)</option>
-                    <option value="smooth">Mais suave (+atraso · 250ms buffer)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (GPU)</label>
+                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (WebCodecs GPU)</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="H264">H.264 (NVENC / AMD — 60 FPS Cravado)</option>
-                    <option value="VP9">VP9 (Melhor imagem em 2K)</option>
-                    <option value="AV1">AV1 (Mais pesado)</option>
+                    <option value="VP8">VP8 Ultra-Rápido (Recomendado · 60 FPS)</option>
+                    <option value="H264">H.264 NVENC / Hardware</option>
+                    <option value="VP9">VP9 Alta Definição (2K)</option>
                   </select>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Buffer de Clipes (30s em 2º plano)</label>
+                  <label className="block text-xs font-medium text-gray-200 mb-1">Clipes e replay (30s sem áudio)</label>
                   <select value={clipConfig} onChange={e => setClipConfig(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="off">Desligado (Máximo FPS na Live)</option>
-                    <option value="720p">Ligado · 720p (Leve)</option>
+                    <option value="720p">Ligado · 720p</option>
                     <option value="1080p">Ligado · 1080p</option>
+                    <option value="off">Desligado</option>
                   </select>
-                </div>
-
-                <div className="pt-1 border-t border-[#222834]">
-                  <button onClick={runIpv6Diagnostic} className="w-full bg-[#1B202B] hover:bg-[#242B3A] border border-[#2E3646] rounded-lg py-2 text-xs font-medium text-white flex items-center justify-center gap-1.5 cursor-pointer">
-                    <span>🌐</span> Assistente de IPv6
-                  </button>
                 </div>
               </div>
             )}
@@ -782,9 +628,6 @@ export default function App() {
               <p className="text-xs text-gray-400 mt-0.5">
                 Clique em <button onClick={handleShareScreen} className="text-gray-200 font-semibold hover:underline cursor-pointer">Compartilhar tela</button> para começar.
               </p>
-              <p className="text-[11px] text-gray-500 mt-3 max-w-md">
-                💡 Dica para 2K 60 FPS: Na janela do Chrome, escolha a aba <b>"Tela cheia"</b> (Entire Screen) ou <b>"Guia do Chrome"</b>. Capturar "Janela" no Windows limita o FPS do navegador.
-              </p>
             </div>
           ) : (
             <div className={`flex-1 grid gap-3 overflow-hidden ${expandedId || activeStreams.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
@@ -794,13 +637,20 @@ export default function App() {
                   <VideoTile
                     key={streamObj.id}
                     streamObj={streamObj}
+                    socketRef={socketRef}
+                    videoChunkHandlersRef={videoChunkHandlersRef}
+                    audioChunkHandlersRef={audioChunkHandlersRef}
+                    clipRecordersRef={clipRecordersRef}
+                    clipChunksRef={clipChunksRef}
+                    clipConfig={clipConfig}
+                    clipDuration={clipDuration}
                     onStop={() => stopStream(streamObj.id)}
                     onMute={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, muted: !s.muted } : s))}
                     onMinimize={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s))}
                     onExpand={() => setExpandedId(expandedId === streamObj.id ? null : streamObj.id)}
                     isExpanded={expandedId === streamObj.id}
-                    onClip={() => saveClip30s(streamObj, false)}
-                    onReplay={() => saveClip30s(streamObj, true)}
+                    onClip={() => saveClip30s(streamObj.id, streamObj.owner, false)}
+                    onReplay={() => saveClip30s(streamObj.id, streamObj.owner, true)}
                   />
                 ))}
             </div>
@@ -870,28 +720,11 @@ export default function App() {
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">Logs WebRTC / Telemetria</h4>
+              <h4 className="text-sm font-semibold">Logs GPU WebCodecs</h4>
               <button onClick={() => setShowLogs(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="bg-[#0B0D11] border border-[#1E232E] rounded-lg p-3 h-64 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1">
               {logs.map((l, i) => <div key={i}>{l}</div>)}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showIpv6Modal && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
-          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-lg p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">🌐 Diagnóstico IPv6 Direto & TURN</h4>
-              <button onClick={() => setShowIpv6Modal(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
-            </div>
-            <div className="text-xs space-y-2 bg-[#0D1016] p-3 rounded-lg border border-[#1E232E]">
-              <div>IPv6 Direto: {ipv6Diag.hasIpv6 ? <span className="text-emerald-400 font-semibold">Detectado</span> : <span className="text-amber-400">Usando IPv4 + TURN</span>}</div>
-              <div className="text-[11px] text-gray-400 font-mono max-h-40 overflow-y-auto pt-2 border-t border-[#1E232E]">
-                {ipv6Diag.candidates.map((c, i) => <div key={i} className="truncate">{c}</div>)}
-              </div>
             </div>
           </div>
         </div>
@@ -912,88 +745,248 @@ export default function App() {
   );
 }
 
-function VideoTile({ streamObj, onStop, onMute, onMinimize, onExpand, isExpanded, onClip, onReplay }) {
-  const videoRef = useRef(null);
-  const [liveStats, setLiveStats] = useState({ res: '', fps: 0, mbps: '0.0' });
-  const prevBytesRef = useRef({ bytes: 0, ts: Date.now() });
+function VideoTile({
+  streamObj,
+  socketRef,
+  videoChunkHandlersRef,
+  audioChunkHandlersRef,
+  clipRecordersRef,
+  clipChunksRef,
+  clipConfig,
+  clipDuration,
+  onStop,
+  onMute,
+  onMinimize,
+  onExpand,
+  isExpanded,
+  onClip,
+  onReplay
+}) {
+  const localVideoRef = useRef(null);
+  const remoteCanvasRef = useRef(null);
+  const remoteAudioRef = useRef(null);
+  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
 
+  // Se for transmissão LOCAL, exibe direto o <video> local e inicia o buffer circular de 30s (sem áudio)
   useEffect(() => {
-    const el = videoRef.current;
-    if (!el || !streamObj.stream) return;
+    if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
+    localVideoRef.current.srcObject = streamObj.stream;
+    localVideoRef.current.play().catch(() => {});
 
-    el.srcObject = streamObj.stream;
-    el.muted = true;
-    el.play().then(() => {
-      if (!streamObj.isLocal) el.muted = streamObj.muted;
-    }).catch(() => {});
+    const vTrack = streamObj.stream.getVideoTracks()[0];
+    if (vTrack && clipConfig !== 'off') {
+      try {
+        const videoOnly = new MediaStream([vTrack]);
+        const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1') ? 'video/mp4;codecs=avc1' : 'video/webm';
+        const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 4000000 });
+        clipChunksRef.current[streamObj.id] = [];
+        rec.ondataavailable = (e) => {
+          if (e.data?.size > 0) {
+            const list = clipChunksRef.current[streamObj.id] || [];
+            list.push({ blob: e.data, ts: Date.now() });
+            const cutoff = Date.now() - clipDuration * 1000;
+            clipChunksRef.current[streamObj.id] = list.length > 2 ? [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)] : list;
+          }
+        };
+        rec.start(1000);
+        clipRecordersRef.current[streamObj.id] = { recorder: rec, mimeType };
+      } catch (e) {}
+    }
+  }, [streamObj.isLocal, streamObj.stream]);
 
-    // Telemetria real do WebRTC: lê os FPS decodificados e Bitrate real da placa de rede a cada 1 segundo
-    const statsInterval = setInterval(async () => {
-      const h = el.videoHeight;
-      const vTrack = streamObj.stream.getVideoTracks()[0];
-      const trackFps = vTrack?.getSettings ? Math.round(vTrack.getSettings().frameRate || 0) : 0;
+  // Se for transmissão REMOTA, decodifica os pacotes binários H.264/VP8 direto na GPU via VideoDecoder -> Canvas!
+  useEffect(() => {
+    if (streamObj.isLocal) return;
 
-      if (streamObj.pc && !streamObj.isLocal) {
-        try {
-          const reports = await streamObj.pc.getStats();
-          reports.forEach(r => {
-            if (r.type === 'inbound-rtp' && r.kind === 'video') {
-              const now = Date.now();
-              const dt = (now - prevBytesRef.current.ts) / 1000;
-              const dBytes = (r.bytesReceived || 0) - prevBytesRef.current.bytes;
-              const mbps = dt > 0 ? ((dBytes * 8) / (dt * 1000000)).toFixed(1) : '0.0';
-              prevBytesRef.current = { bytes: r.bytesReceived || 0, ts: now };
+    const canvas = remoteCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
-              setLiveStats({
-                res: h ? `${h}p` : streamObj.res,
-                fps: Math.round(r.framesPerSecond || trackFps || streamObj.fps),
-                mbps
-              });
-            }
-          });
-        } catch (e) {}
-      } else {
-        setLiveStats({
-          res: h ? `${h}p` : streamObj.res,
-          fps: trackFps || streamObj.fps,
-          mbps: 'Local'
+    let decoder = null;
+    let configuredCodec = null;
+    let waitingForKey = true;
+    let framesRendered = 0;
+    let bytesCount = 0;
+    let currentW = 1920;
+    let currentH = 1080;
+
+    const initDecoder = (codecStr) => {
+      try {
+        if (decoder && decoder.state !== 'closed') decoder.close();
+      } catch (e) {}
+
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+            canvas.width = frame.displayWidth;
+            canvas.height = frame.displayHeight;
+          }
+          currentW = frame.displayWidth;
+          currentH = frame.displayHeight;
+          ctx.drawImage(frame, 0, 0);
+          frame.close();
+          framesRendered++;
+        },
+        error: () => {
+          waitingForKey = true;
+          socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+        }
+      });
+
+      const cfg = codecStr.startsWith('avc1')
+        ? { codec: codecStr, avc: { format: 'annexb' }, optimizeForLatency: true }
+        : { codec: codecStr, optimizeForLatency: true };
+
+      decoder.configure(cfg);
+      configuredCodec = codecStr;
+      waitingForKey = true;
+    };
+
+    videoChunkHandlersRef.current[streamObj.id] = (meta, buffer) => {
+      try {
+        if (!decoder || decoder.state === 'closed' || configuredCodec !== meta.c) {
+          initDecoder(meta.c || 'vp8');
+        }
+        if (waitingForKey) {
+          if (meta.t !== 'key') {
+            socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+            return;
+          }
+          waitingForKey = false;
+        }
+        const uint8 = new Uint8Array(buffer);
+        bytesCount += uint8.byteLength;
+        const chunk = new EncodedVideoChunk({
+          type: meta.t,
+          timestamp: meta.ts || performance.now() * 1000,
+          data: uint8
         });
+        decoder.decode(chunk);
+      } catch (err) {
+        waitingForKey = true;
+        socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
       }
+    };
+
+    // Decodificador de Áudio Opus Remoto
+    let audioDecoder = null;
+    if ('AudioDecoder' in window && 'MediaStreamTrackGenerator' in window) {
+      try {
+        const trackGen = new MediaStreamTrackGenerator({ kind: 'audio' });
+        const writer = trackGen.writable.getWriter();
+        const remoteAudioStream = new MediaStream([trackGen]);
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = remoteAudioStream;
+          remoteAudioRef.current.play().catch(() => {});
+        }
+        audioDecoder = new AudioDecoder({
+          output: (audioData) => {
+            writer.write(audioData).catch(() => {});
+            audioData.close();
+          },
+          error: () => {}
+        });
+        audioDecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+
+        audioChunkHandlersRef.current[streamObj.id] = (meta, buffer) => {
+          if (audioDecoder.state === 'configured') {
+            try {
+              audioDecoder.decode(new EncodedAudioChunk({
+                type: 'key',
+                timestamp: meta.ts || performance.now() * 1000,
+                data: new Uint8Array(buffer)
+              }));
+            } catch (e) {}
+          }
+        };
+      } catch (e) {}
+    }
+
+    // Inicia buffer de Clipe de 30s (sem áudio) direto do Canvas GPU remoto
+    if (clipConfig !== 'off' && canvas.captureStream) {
+      setTimeout(() => {
+        try {
+          const canvasStream = canvas.captureStream(30);
+          const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1') ? 'video/mp4;codecs=avc1' : 'video/webm';
+          const rec = new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond: 4000000 });
+          clipChunksRef.current[streamObj.id] = [];
+          rec.ondataavailable = (e) => {
+            if (e.data?.size > 0) {
+              const list = clipChunksRef.current[streamObj.id] || [];
+              list.push({ blob: e.data, ts: Date.now() });
+              const cutoff = Date.now() - clipDuration * 1000;
+              clipChunksRef.current[streamObj.id] = list.length > 2 ? [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)] : list;
+            }
+          };
+          rec.start(1000);
+          clipRecordersRef.current[streamObj.id] = { recorder: rec, mimeType };
+        } catch (e) {}
+      }, 1500);
+    }
+
+    // Pede um Keyframe imediatamente ao montar o componente
+    socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+
+    const statTimer = setInterval(() => {
+      const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
+      setStats({ w: currentW, h: currentH, fps: framesRendered, mbps });
+      framesRendered = 0;
+      bytesCount = 0;
     }, 1000);
 
-    return () => clearInterval(statsInterval);
-  }, [streamObj.stream, streamObj.pc]);
+    return () => {
+      clearInterval(statTimer);
+      delete videoChunkHandlersRef.current[streamObj.id];
+      delete audioChunkHandlersRef.current[streamObj.id];
+      try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (e) {}
+      try { if (audioDecoder && audioDecoder.state !== 'closed') audioDecoder.close(); } catch (e) {}
+    };
+  }, [streamObj.id, streamObj.isLocal]);
 
   useEffect(() => {
-    if (videoRef.current && !streamObj.isLocal) {
-      videoRef.current.muted = streamObj.muted;
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.muted = streamObj.muted;
     }
-  }, [streamObj.muted, streamObj.isLocal]);
+  }, [streamObj.muted]);
 
   return (
     <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted={streamObj.isLocal ? true : streamObj.muted}
-        className="w-full h-full object-contain bg-black"
-      />
+      {streamObj.isLocal ? (
+        <video
+          ref={localVideoRef}
+          autoPlay
+          playsInline
+          muted
+          className="w-full h-full object-contain bg-black"
+        />
+      ) : (
+        <>
+          <canvas
+            ref={remoteCanvasRef}
+            className="w-full h-full object-contain bg-black"
+          />
+          <audio ref={remoteAudioRef} autoPlay muted={streamObj.muted} />
+        </>
+      )}
 
       <div className="absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs">
         <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
         <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
         <span className="text-emerald-300 font-mono text-[11px]">
-          · {liveStats.res || streamObj.res} · {liveStats.fps || streamObj.fps} FPS {!streamObj.isLocal && `· ${liveStats.mbps} Mbps`}
+          {streamObj.isLocal
+            ? `· ${streamObj.res} · ${streamObj.fps} FPS · Local`
+            : `· ${stats.h ? stats.h + 'p' : streamObj.res} · ${stats.fps} FPS · ${stats.mbps} Mbps`}
         </span>
       </div>
 
       <div className="absolute bottom-2.5 right-2.5 z-30 flex items-center gap-1.5 bg-black/80 p-1.5 rounded-lg border border-white/10">
         <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">🎬 Clipe 30s</button>
         <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
-        <button onClick={onMute} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
-          {streamObj.muted ? '🔇 Mutado' : '🔊 Áudio'}
-        </button>
+        {!streamObj.isLocal && (
+          <button onClick={onMute} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
+            {streamObj.muted ? '🔇 Mutado' : '🔊 Áudio'}
+          </button>
+        )}
         <button onClick={onMinimize} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">_ Minimizar</button>
         <button onClick={onExpand} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
           {isExpanded ? '🗗 Restaurar' : '⛶ Expandir'}

@@ -15,32 +15,14 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 1e7,
+  maxHttpBufferSize: 2e7,
   pingTimeout: 60000,
-  pingInterval: 25000
-});
-
-// Rota que fornece servidores ICE/TURN atualizados para evitar bloqueio de CGNAT em 2K 60fps
-app.get('/api/ice', async (req, res) => {
-  const defaultIce = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-    {
-      urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-        'turns:openrelay.metered.ca:443?transport=tcp'
-      ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    }
-  ];
-  res.json({ iceServers: defaultIce });
+  pingInterval: 15000,
+  perMessageDeflate: false // Zero compressão extra de CPU para pacotes binários de vídeo
 });
 
 const rooms = new Map();
+const activeStreams = new Map(); // roomName -> Map(streamId -> meta)
 
 io.on('connection', (socket) => {
   let currentRoom = null;
@@ -52,81 +34,64 @@ io.on('connection', (socket) => {
     currentRoom = cleanRoom;
     socket.join(cleanRoom);
 
-    if (!rooms.has(cleanRoom)) {
-      rooms.set(cleanRoom, new Map());
-    }
+    if (!rooms.has(cleanRoom)) rooms.set(cleanRoom, new Map());
+    if (!activeStreams.has(cleanRoom)) activeStreams.set(cleanRoom, new Map());
 
     const roomUsers = rooms.get(cleanRoom);
     roomUsers.set(socket.id, {
       id: socket.id,
       nick: cleanNick,
-      conn: 'Conectado'
+      conn: 'GPU Stream'
     });
 
     io.to(cleanRoom).emit('room-users', Array.from(roomUsers.values()));
 
-    socket.to(cleanRoom).emit('user-joined', {
-      id: socket.id,
-      nick: cleanNick
-    });
-  });
-
-  socket.on('request-streams', () => {
-    if (currentRoom) {
-      socket.to(currentRoom).emit('user-joined', {
-        id: socket.id,
-        nick: 'Participante'
-      });
+    // Envia imediatamente a lista de lives ativas na sala para quem acabou de entrar
+    const currentStreams = Array.from(activeStreams.get(cleanRoom).values());
+    if (currentStreams.length > 0) {
+      socket.emit('active-streams', currentStreams);
+      // Pede um Keyframe imediato aos transmissores para a tela abrir em < 100ms
+      socket.to(cleanRoom).emit('force-keyframe');
     }
   });
 
-  socket.on('webrtc-signal', ({ targetId, signal, streamMeta }) => {
-    io.to(targetId).emit('webrtc-signal', {
-      senderId: socket.id,
-      signal,
-      streamMeta
-    });
+  socket.on('start-stream', (meta) => {
+    if (!currentRoom || !activeStreams.has(currentRoom)) return;
+    const streamData = { ...meta, senderId: socket.id };
+    activeStreams.get(currentRoom).set(meta.streamId, streamData);
+    socket.to(currentRoom).emit('stream-started', streamData);
   });
 
-  socket.on('stream-meta-update', ({ streamId, res, fps }) => {
+  // Retransmissão de pacotes de vídeo H.264/VP8/VP9 codificados na GPU (WebCodecs Binary Chunk)
+  socket.on('v-chunk', (meta, buffer) => {
     if (currentRoom) {
-      socket.to(currentRoom).emit('stream-meta-update', { streamId, res, fps });
+      socket.to(currentRoom).emit('v-chunk', meta, buffer);
     }
   });
 
-  socket.on('relay-frame', (payload) => {
+  // Retransmissão de pacotes de áudio Opus (WebCodecs Binary Audio)
+  socket.on('a-chunk', (meta, buffer) => {
     if (currentRoom) {
-      socket.volatile.to(currentRoom).emit('relay-frame', {
-        senderId: socket.id,
-        ...payload
-      });
+      socket.to(currentRoom).emit('a-chunk', meta, buffer);
+    }
+  });
+
+  socket.on('request-keyframe', ({ streamId }) => {
+    if (currentRoom) {
+      socket.to(currentRoom).emit('force-keyframe', { streamId });
     }
   });
 
   socket.on('stop-stream', ({ streamId }) => {
     if (currentRoom) {
-      socket.to(currentRoom).emit('peer-stopped-stream', {
-        senderId: socket.id,
-        streamId
-      });
-    }
-  });
-
-  socket.on('update-conn-type', ({ connType }) => {
-    if (currentRoom && rooms.has(currentRoom)) {
-      const roomUsers = rooms.get(currentRoom);
-      const u = roomUsers.get(socket.id);
-      if (u) {
-        u.conn = String(connType).slice(0, 25);
-        io.to(currentRoom).emit('room-users', Array.from(roomUsers.values()));
-      }
+      activeStreams.get(currentRoom)?.delete(streamId);
+      socket.to(currentRoom).emit('peer-stopped-stream', { streamId });
     }
   });
 
   socket.on('chat-message', ({ text }) => {
     if (!currentRoom) return;
-    const roomUsers = rooms.get(currentRoom);
-    const sender = roomUsers?.get(socket.id);
+    const sender = rooms.get(currentRoom)?.get(socket.id);
     if (!sender || !text || !String(text).trim()) return;
 
     io.to(currentRoom).emit('chat-message', {
@@ -141,11 +106,22 @@ io.on('connection', (socket) => {
     if (currentRoom && rooms.has(currentRoom)) {
       const roomUsers = rooms.get(currentRoom);
       roomUsers.delete(socket.id);
+
+      const roomStreams = activeStreams.get(currentRoom);
+      if (roomStreams) {
+        for (const [sId, sMeta] of roomStreams.entries()) {
+          if (sMeta.senderId === socket.id) {
+            roomStreams.delete(sId);
+            socket.to(currentRoom).emit('peer-stopped-stream', { streamId: sId });
+          }
+        }
+      }
+
       if (roomUsers.size === 0) {
         rooms.delete(currentRoom);
+        activeStreams.delete(currentRoom);
       } else {
         io.to(currentRoom).emit('room-users', Array.from(roomUsers.values()));
-        io.to(currentRoom).emit('user-left', { id: socket.id });
       }
     }
   });
@@ -159,5 +135,5 @@ app.get('*', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[TELINHA SERVER] Ativo na porta ${PORT}`);
+  console.log(`[TELINHA WEBCODECS SFU] Rodando na porta ${PORT}`);
 });
