@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
-// Lista reforçada de STUN + múltiplos servidores TURN (UDP, TCP e TLS na porta 443 para furar CGNAT/Firewall)
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -15,16 +14,6 @@ const ICE_SERVERS = [
     ],
     username: 'openrelayproject',
     credential: 'openrelayproject'
-  },
-  {
-    urls: [
-      'turn:standard.relay.metered.ca:80',
-      'turn:standard.relay.metered.ca:80?transport=tcp',
-      'turn:standard.relay.metered.ca:443',
-      'turns:standard.relay.metered.ca:443?transport=tcp'
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
   }
 ];
 
@@ -33,7 +22,6 @@ export default function App() {
   const [nickname, setNickname] = useState(() => localStorage.getItem('tl_nick') || 'gosadinhas');
   const [roomName, setRoomName] = useState('squad-brasil');
 
-  // Controles da Barra Superior
   const [quality, setQuality] = useState('auto');
   const [sharpness, setSharpness] = useState('detail');
   const [fps, setFps] = useState(30);
@@ -43,15 +31,12 @@ export default function App() {
   const [showIpv6Modal, setShowIpv6Modal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
-  // Configurações (Padrão H264/Auto para evitar tela preta de decodificador AV1)
-  const [smoothness, setSmoothness] = useState(() => localStorage.getItem('tl_smooth') || 'smooth');
-  const [codec, setCodec] = useState(() => localStorage.getItem('tl_codec') || 'AUTO');
-  const [clipConfig, setClipConfig] = useState(() => localStorage.getItem('tl_clip') || '720p');
+  const [smoothness, setSmoothness] = useState('smooth');
+  const [codec, setCodec] = useState('AUTO');
+  const [clipConfig, setClipConfig] = useState('720p');
   const [clipDuration, setClipDuration] = useState(30);
-  const [connPolicy, setConnPolicy] = useState(() => localStorage.getItem('tl_policy') || 'auto');
-  const [removeDiscordAudio, setRemoveDiscordAudio] = useState(true);
+  const [connPolicy, setConnPolicy] = useState('auto');
 
-  // Estado da Sala
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
@@ -62,12 +47,13 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [ipv6Diag, setIpv6Diag] = useState({ running: false, hasIpv6: false, candidates: [] });
 
-  // Refs WebRTC + Fila de Candidatos ICE
   const socketRef = useRef(null);
   const pcsRef = useRef({});
   const pendingCandidatesRef = useRef({});
   const participantsRef = useRef([]);
   const localStreamsRef = useRef([]);
+  const relayIntervalsRef = useRef({});
+  const relayFramesRef = useRef({}); // streamId -> última imagem base64 de fallback
   const clipChunksRef = useRef({});
   const recordersRef = useRef({});
 
@@ -83,21 +69,18 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem('tl_nick', nickname);
-    localStorage.setItem('tl_smooth', smoothness);
-    localStorage.setItem('tl_codec', codec);
-    localStorage.setItem('tl_clip', clipConfig);
-    localStorage.setItem('tl_policy', connPolicy);
-  }, [nickname, smoothness, codec, clipConfig, connPolicy]);
+  }, [nickname]);
 
   useEffect(() => {
     if (!inRoom) return;
 
-    const socket = io({ transports: ['websocket', 'polling'] });
+    const socket = io({ transports: ['websocket'] });
     socketRef.current = socket;
 
     socket.on('connect', () => {
       addLog(`Conectado ao servidor (ID: ${socket.id})`);
       socket.emit('join-room', { roomName, nickname });
+      setTimeout(() => socket.emit('request-streams'), 800);
     });
 
     socket.on('room-users', (usersList) => {
@@ -106,7 +89,8 @@ export default function App() {
     });
 
     socket.on('user-joined', ({ id, nick }) => {
-      addLog(`${nick} entrou na sala. Enviando nossas transmissões ativas...`);
+      if (id === socket.id) return;
+      addLog(`Sincronizando transmissões com ${nick || id}...`);
       localStreamsRef.current.forEach(ls => {
         createOfferForPeer(id, ls);
       });
@@ -118,13 +102,12 @@ export default function App() {
 
       try {
         if (signal.type === 'offer') {
-          addLog(`Recebendo oferta de vídeo de ${streamMeta.owner}...`);
+          addLog(`Recebendo transmissão WebRTC de ${streamMeta.owner}...`);
           const pc = createPeerConnection(senderId, streamMeta, false);
           pcsRef.current[key] = pc;
 
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
 
-          // Processa candidatos ICE que chegaram antes da oferta terminar
           const queued = pendingCandidatesRef.current[key] || [];
           for (const cand of queued) {
             await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
@@ -141,14 +124,14 @@ export default function App() {
           });
         } else if (signal.type === 'answer') {
           const pc = pcsRef.current[key];
-          if (pc && pc.signalingState !== 'stable') {
+          if (pc && pc.signalingState === 'have-local-offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(signal));
             const queued = pendingCandidatesRef.current[key] || [];
             for (const cand of queued) {
               await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
             }
             pendingCandidatesRef.current[key] = [];
-            addLog(`Handshake WebRTC concluído para [${streamMeta.streamId}]`);
+            addLog(`Conexão de vídeo estabelecida com ${ senderId.slice(0,5) }!`);
           }
         } else if (signal.candidate) {
           const pc = pcsRef.current[key];
@@ -160,8 +143,35 @@ export default function App() {
           }
         }
       } catch (err) {
-        addLog(`Erro na sinalização WebRTC: ${err.message}`);
+        addLog(`Aviso WebRTC: ${err.message}`);
       }
+    });
+
+    // Recebe quadros do Plano B Automático (Garante imagem visível mesmo se o UDP/CGNAT bloquear WebRTC)
+    socket.on('relay-frame', ({ senderId, streamId, owner, res, fps: rFps, frame }) => {
+      relayFramesRef.current[streamId] = frame;
+      setStreams(prev => {
+        const exists = prev.find(s => s.id === streamId);
+        if (exists) {
+          return prev.map(s => s.id === streamId ? { ...s, lastRelayFrame: frame } : s);
+        }
+        return [
+          ...prev,
+          {
+            id: streamId,
+            peerId: senderId,
+            owner: owner || 'Amigo',
+            type: 'Tela (Plano B)',
+            stream: null,
+            lastRelayFrame: frame,
+            muted: true,
+            minimized: false,
+            fps: rFps || 30,
+            res: res || '1080p',
+            isLocal: false
+          }
+        ];
+      });
     });
 
     socket.on('peer-stopped-stream', ({ senderId, streamId }) => {
@@ -170,8 +180,8 @@ export default function App() {
         pcsRef.current[key].close();
         delete pcsRef.current[key];
       }
+      delete relayFramesRef.current[streamId];
       setStreams(prev => prev.filter(s => s.id !== streamId));
-      addLog(`Transmissão encerrada pelo participante.`);
     });
 
     socket.on('user-left', ({ id }) => {
@@ -189,35 +199,14 @@ export default function App() {
     });
 
     return () => {
+      Object.values(relayIntervalsRef.current).forEach(clearInterval);
       localStreamsRef.current.forEach(s => s.stream.getTracks().forEach(t => t.stop()));
       Object.values(pcsRef.current).forEach(pc => pc.close());
       socket.disconnect();
     };
   }, [inRoom, roomName, nickname]);
 
-  const applyCodecPreference = (pc) => {
-    if (codec === 'AUTO') return;
-    try {
-      if (!RTCRtpSender.getCapabilities) return;
-      const caps = RTCRtpSender.getCapabilities('video');
-      if (!caps || !caps.codecs) return;
-      const preferred = caps.codecs.filter(c =>
-        c.mimeType.toLowerCase().includes(codec.toLowerCase())
-      );
-      const others = caps.codecs.filter(c =>
-        !c.mimeType.toLowerCase().includes(codec.toLowerCase())
-      );
-      if (preferred.length > 0) {
-        pc.getTransceivers().forEach(t => {
-          if (t.setCodecPreferences) {
-            t.setCodecPreferences([...preferred, ...others]);
-          }
-        });
-      }
-    } catch (e) {}
-  };
-
-  const createPeerConnection = (peerId, streamMeta, isInitiator) => {
+  const createPeerConnection = (peerId, streamMeta) => {
     const key = `${peerId}_${streamMeta.streamId}`;
     if (pcsRef.current[key]) {
       pcsRef.current[key].close();
@@ -226,12 +215,11 @@ export default function App() {
     const pc = new RTCPeerConnection({
       iceServers: ICE_SERVERS,
       iceTransportPolicy: connPolicy === 'turn' ? 'relay' : 'all',
-      iceCandidatePoolSize: 10
+      bundlePolicy: 'max-bundle'
     });
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        if (connPolicy === 'ipv6' && !event.candidate.candidate.includes(':')) return;
         socketRef.current?.emit('webrtc-signal', {
           targetId: peerId,
           signal: { candidate: event.candidate },
@@ -240,120 +228,110 @@ export default function App() {
       }
     };
 
-    // Reconstrói o MediaStream remoto garantidamente mesmo quando o navegador envia event.streams vazio
-    const remoteMediaStream = new MediaStream();
+    const fallbackRemoteStream = new MediaStream();
 
     pc.ontrack = (event) => {
-      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : remoteMediaStream;
-      if (!event.streams || !event.streams[0]) {
-        remoteMediaStream.addTrack(event.track);
-      }
-
-      if (event.receiver && 'playoutDelayHint' in event.receiver) {
-        event.receiver.playoutDelayHint = smoothness === 'smooth' ? 0.3 : smoothness === 'balanced' ? 0.1 : 0.0;
-      }
-
-      const hasAudio = incomingStream.getAudioTracks().length > 0;
+      fallbackRemoteStream.addTrack(event.track);
+      const activeStream = (event.streams && event.streams[0]) ? event.streams[0] : fallbackRemoteStream;
 
       setStreams(prev => {
         const exists = prev.find(s => s.id === streamMeta.streamId);
         if (exists) {
-          return prev.map(s => s.id === streamMeta.streamId ? { ...s, stream: incomingStream, hasAudio } : s);
+          return prev.map(s => s.id === streamMeta.streamId ? { ...s, stream: activeStream } : s);
         }
         const newObj = {
           id: streamMeta.streamId,
           peerId,
           owner: streamMeta.owner,
           type: streamMeta.type,
-          stream: incomingStream,
-          // Começa mutado se tiver áudio para o Chrome NÃO bloquear o vídeo (Autoplay Policy)
-          muted: hasAudio,
-          hasAudio,
+          stream: activeStream,
+          lastRelayFrame: relayFramesRef.current[streamMeta.streamId] || null,
+          muted: false,
           minimized: false,
           fps: streamMeta.fps,
           res: streamMeta.res,
-          bitrate: 'Conectado',
           isLocal: false
         };
-        startCircularClipBuffer(streamMeta.streamId, incomingStream);
-        addLog(`Vídeo recebido de ${streamMeta.owner} (${streamMeta.res} @ ${streamMeta.fps}fps)`);
+        startCircularClipBuffer(streamMeta.streamId, activeStream);
         return [...prev, newObj];
       });
     };
 
     pc.oniceconnectionstatechange = () => {
-      const state = pc.iceConnectionState;
-      addLog(`ICE [${streamMeta.owner}]: ${state}`);
-
-      if (state === 'connected' || state === 'completed') {
-        pc.getStats().then(stats => {
-          stats.forEach(report => {
-            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-              socketRef.current?.emit('update-conn-type', {
-                connType: connPolicy === 'turn' ? 'TURN Plano B' : 'WebRTC Ativo'
-              });
-            }
-          });
-        });
-      } else if ((state === 'failed' || state === 'disconnected') && isInitiator) {
-        addLog(`Conexão instável com ${streamMeta.owner}. Executando ICE Restart (Plano B TURN)...`);
-        try {
-          pc.restartIce();
-          pc.createOffer({ iceRestart: true }).then(offer => {
-            pc.setLocalDescription(offer);
-            socketRef.current?.emit('webrtc-signal', {
-              targetId: peerId,
-              signal: offer,
-              streamMeta
-            });
-          });
-        } catch (e) {}
-      }
+      addLog(`ICE [${streamMeta.owner}]: ${pc.iceConnectionState}`);
     };
 
     return pc;
   };
 
   const createOfferForPeer = async (targetPeerId, localStreamObj) => {
-    const streamMeta = {
-      streamId: localStreamObj.id,
-      owner: nickname,
-      type: localStreamObj.type,
-      res: localStreamObj.res,
-      fps: localStreamObj.fps
-    };
-    const key = `${targetPeerId}_${localStreamObj.id}`;
-    const pc = createPeerConnection(targetPeerId, streamMeta, true);
-    pcsRef.current[key] = pc;
+    try {
+      const streamMeta = {
+        streamId: localStreamObj.id,
+        owner: nickname,
+        type: localStreamObj.type,
+        res: localStreamObj.res,
+        fps: localStreamObj.fps
+      };
+      const key = `${targetPeerId}_${localStreamObj.id}`;
+      const pc = createPeerConnection(targetPeerId, streamMeta);
+      pcsRef.current[key] = pc;
 
-    localStreamObj.stream.getTracks().forEach(track => {
-      const sender = pc.addTrack(track, localStreamObj.stream);
-      if (track.kind === 'video') {
-        try {
-          const params = sender.getParameters();
-          if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-          params.encodings[0].maxBitrate = 6000000;
-          params.encodings[0].maxFramerate = Number(localStreamObj.fps);
-          sender.setParameters(params).catch(() => {});
-        } catch (e) {}
-      }
-    });
+      localStreamObj.stream.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamObj.stream);
+      });
 
-    applyCodecPreference(pc);
+      const offer = await pc.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true
+      });
+      await pc.setLocalDescription(offer);
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+      socketRef.current?.emit('webrtc-signal', {
+        targetId: targetPeerId,
+        signal: pc.localDescription,
+        streamMeta
+      });
+    } catch (err) {
+      addLog(`Erro ao criar oferta: ${err.message}`);
+    }
+  };
 
-    socketRef.current?.emit('webrtc-signal', {
-      targetId: targetPeerId,
-      signal: pc.localDescription,
-      streamMeta
-    });
+  // Inicia também o transmissor de segurança Plano B (Canvas -> WebSocket) para furar qualquer CGNAT imediatamente
+  const startBackupRelaySender = (streamObj) => {
+    const hiddenVideo = document.createElement('video');
+    hiddenVideo.srcObject = streamObj.stream;
+    hiddenVideo.muted = true;
+    hiddenVideo.playsInline = true;
+    hiddenVideo.play().catch(() => {});
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    const interval = setInterval(() => {
+      if (!hiddenVideo.videoWidth) return;
+      const targetW = 854;
+      const targetH = Math.round((hiddenVideo.videoHeight / hiddenVideo.videoWidth) * targetW) || 480;
+      canvas.width = targetW;
+      canvas.height = targetH;
+      ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
+      const base64Frame = canvas.toDataURL('image/jpeg', 0.62);
+
+      socketRef.current?.emit('relay-frame', {
+        streamId: streamObj.id,
+        owner: nickname,
+        res: streamObj.res,
+        fps: streamObj.fps,
+        frame: base64Frame
+      });
+    }, 180); // Garante imagem ao vivo contínua mesmo se o UDP do WebRTC estiver bloqueado
+
+    relayIntervalsRef.current[streamObj.id] = interval;
   };
 
   // Buffer Circular de 30s (SOMENTE VÍDEO — ZERO ÁUDIO)
   const startCircularClipBuffer = (streamId, mediaStream) => {
-    if (clipConfig === 'off') return;
+    if (clipConfig === 'off' || !mediaStream) return;
     setTimeout(() => {
       try {
         const videoTracks = mediaStream.getVideoTracks();
@@ -361,13 +339,11 @@ export default function App() {
         const videoOnlyStream = new MediaStream([videoTracks[0]]);
         const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')
           ? 'video/mp4;codecs=avc1'
-          : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-          ? 'video/webm;codecs=vp8'
           : 'video/webm';
 
         const recorder = new MediaRecorder(videoOnlyStream, {
           mimeType,
-          videoBitsPerSecond: clipConfig === '1080p' ? 5000000 : 3000000
+          videoBitsPerSecond: 3500000
         });
 
         clipChunksRef.current[streamId] = [];
@@ -392,7 +368,7 @@ export default function App() {
   const saveClip30s = (streamObj, openReplayOnly = false) => {
     const chunks = clipChunksRef.current[streamObj.id] || [];
     if (!chunks.length) {
-      alert('Aguarde pelo menos 2 segundos de vídeo para acumular o buffer de 30 segundos.');
+      alert('Aguarde alguns segundos de transmissão para salvar os últimos 30s.');
       return;
     }
     const mime = recordersRef.current[streamObj.id]?.mimeType || 'video/webm';
@@ -411,7 +387,6 @@ export default function App() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    addLog(`Clipe de ${clipDuration}s (sem áudio) salvo em Downloads!`);
   };
 
   const handleShareScreen = async () => {
@@ -449,17 +424,16 @@ export default function App() {
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
         muted: true,
-        hasAudio: false,
         minimized: false,
         fps: targetFps,
         res: quality === 'auto' ? '1080p' : quality,
-        bitrate: 'Ao Vivo',
         isLocal: true
       };
 
       localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
       startCircularClipBuffer(newId, mediaStream);
+      startBackupRelaySender(newStreamObj);
 
       participantsRef.current.forEach(p => {
         if (p.id !== socketRef.current?.id) {
@@ -490,17 +464,16 @@ export default function App() {
         type: 'Câmera',
         stream: mediaStream,
         muted: true,
-        hasAudio: false,
         minimized: false,
         fps: Number(fps),
         res: '720p',
-        bitrate: 'Ao Vivo',
         isLocal: true
       };
 
       localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
       startCircularClipBuffer(newId, mediaStream);
+      startBackupRelaySender(newStreamObj);
 
       participantsRef.current.forEach(p => {
         if (p.id !== socketRef.current?.id) {
@@ -513,6 +486,10 @@ export default function App() {
   };
 
   const stopStream = (streamId) => {
+    if (relayIntervalsRef.current[streamId]) {
+      clearInterval(relayIntervalsRef.current[streamId]);
+      delete relayIntervalsRef.current[streamId];
+    }
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
       if (target?.stream && target.isLocal) {
@@ -542,10 +519,7 @@ export default function App() {
     };
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    setTimeout(() => {
-      pc.close();
-      setIpv6Diag(prev => ({ ...prev, running: false }));
-    }, 3000);
+    setTimeout(() => pc.close(), 3000);
   };
 
   const sendChat = (e) => {
@@ -558,7 +532,7 @@ export default function App() {
   const copyRoomLink = () => {
     const url = `${window.location.origin}/?sala=${encodeURIComponent(roomName)}`;
     navigator.clipboard.writeText(url);
-    alert(`Link da sala copiado:\n${url}`);
+    alert(`Link copiado:\n${url}`);
   };
 
   if (!inRoom) {
@@ -682,30 +656,21 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de vídeo (para quem compartilha)</label>
+                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de vídeo</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="AUTO">Automático (H.264 / VP8 — Recomendado)</option>
-                    <option value="H264">H.264 (NVENC / Hardware)</option>
-                    <option value="VP9">VP9 (Alta Qualidade)</option>
-                    <option value="AV1">AV1 (Mais novo, pesa bastante)</option>
+                    <option value="AUTO">Automático (H.264 / VP8)</option>
+                    <option value="H264">H.264 (NVENC)</option>
+                    <option value="VP9">VP9</option>
+                    <option value="AV1">AV1</option>
                   </select>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Clipes e replay (para quem assiste)</label>
+                  <label className="block text-xs font-medium text-gray-200 mb-1">Clipes e replay</label>
                   <select value={clipConfig} onChange={e => setClipConfig(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
                     <option value="720p">Ligado · 720p (leve)</option>
                     <option value="1080p">Ligado · 1080p</option>
                     <option value="off">Desligado</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Modo de Conexão</label>
-                  <select value={connPolicy} onChange={e => setConnPolicy(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="auto">Automático (IPv6 Direto + Plano B)</option>
-                    <option value="turn">Forçar Plano B (TURN Relay — se ficar preto)</option>
-                    <option value="ipv6">Somente Conexão Direta (IPv6)</option>
                   </select>
                 </div>
 
@@ -722,11 +687,7 @@ export default function App() {
             📋 Logs
           </button>
 
-          <button onClick={() => alert('App Desktop Tauri pronto.')} className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer">
-            Baixar app
-          </button>
-
-          <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
+          <button onClick={copyRoomLink} className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer">
             🔗 Link
           </button>
 
@@ -775,10 +736,6 @@ export default function App() {
               ))}
             </div>
           )}
-
-          <div className="absolute bottom-1.5 left-3 text-[10px] text-gray-600 pointer-events-none">
-            Telinha v1.13.4
-          </div>
         </main>
 
         <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0">
@@ -834,7 +791,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">Logs WebRTC / Socket.IO</h4>
+              <h4 className="text-sm font-semibold">Logs WebRTC / Plano B</h4>
               <button onClick={() => setShowLogs(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="bg-[#0B0D11] border border-[#1E232E] rounded-lg p-3 h-64 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1">
@@ -852,7 +809,7 @@ export default function App() {
               <button onClick={() => setShowIpv6Modal(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="text-xs space-y-2 bg-[#0D1016] p-3 rounded-lg border border-[#1E232E]">
-              <div>IPv6 Direto Detectado: {ipv6Diag.hasIpv6 ? <span className="text-emerald-400 font-semibold">Sim (Sem NAT)</span> : <span className="text-amber-400">Usando IPv4 + Plano B (TURN Ativo)</span>}</div>
+              <div>IPv6 Direto: {ipv6Diag.hasIpv6 ? <span className="text-emerald-400 font-semibold">Detectado</span> : <span className="text-amber-400">Usando IPv4 + Plano B Híbrido</span>}</div>
               <div className="text-[11px] text-gray-400 font-mono max-h-40 overflow-y-auto pt-2 border-t border-[#1E232E]">
                 {ipv6Diag.candidates.map((c, i) => <div key={i} className="truncate">{c}</div>)}
               </div>
@@ -878,44 +835,66 @@ export default function App() {
 
 function VideoTile({ streamObj, onStop, onMute, onMinimize, onExpand, isExpanded, onClip, onReplay }) {
   const videoRef = useRef(null);
+  const [webrtcPlaying, setWebrtcPlaying] = useState(false);
 
   useEffect(() => {
     const el = videoRef.current;
     if (!el || !streamObj.stream) return;
 
     el.srcObject = streamObj.stream;
+    el.muted = true; // Garante início sem bloqueio do navegador
+    el.play().then(() => {
+      if (!streamObj.isLocal) el.muted = streamObj.muted;
+    }).catch(() => {});
 
-    const tryPlay = () => {
-      el.play().catch(() => {
-        // Se o Chrome bloquear por causa de áudio, força mudo e dá play no vídeo imediatamente
-        el.muted = true;
-        el.play().catch(() => {});
-      });
-    };
+    const checkVideoFrames = setInterval(() => {
+      if (el.videoWidth > 0 && el.readyState >= 2) {
+        setWebrtcPlaying(true);
+      }
+    }, 500);
 
-    tryPlay();
-    streamObj.stream.onaddtrack = () => tryPlay();
+    return () => clearInterval(checkVideoFrames);
   }, [streamObj.stream]);
+
+  useEffect(() => {
+    if (videoRef.current && !streamObj.isLocal) {
+      videoRef.current.muted = streamObj.muted;
+    }
+  }, [streamObj.muted, streamObj.isLocal]);
 
   return (
     <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
+      {/* Vídeo WebRTC P2P Direto */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
-        muted={streamObj.muted}
-        className="w-full h-full object-contain bg-black"
+        muted={streamObj.isLocal ? true : streamObj.muted}
+        className={`w-full h-full object-contain bg-black ${(!streamObj.isLocal && !webrtcPlaying && streamObj.lastRelayFrame) ? 'hidden' : 'block'}`}
       />
+
+      {/* Plano B Automático (Mostra a imagem via WebSocket imediatamente se o CGNAT bloquear o WebRTC UDP) */}
+      {!streamObj.isLocal && !webrtcPlaying && streamObj.lastRelayFrame && (
+        <img
+          src={streamObj.lastRelayFrame}
+          alt={streamObj.owner}
+          className="w-full h-full object-contain bg-black"
+        />
+      )}
+
       <div className="absolute top-2.5 left-2.5 flex items-center gap-2 bg-black/75 px-2.5 py-1 rounded-md border border-white/10 text-xs">
         <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
         <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
-        <span className="text-gray-400 text-[11px]">· {streamObj.res} · {streamObj.fps} FPS</span>
+        <span className="text-gray-400 text-[11px]">
+          · {streamObj.res} · {streamObj.fps} FPS {!streamObj.isLocal && (!webrtcPlaying && streamObj.lastRelayFrame ? '· Plano B Ativo' : '· Direto')}
+        </span>
       </div>
+
       <div className="absolute bottom-2.5 right-2.5 flex items-center gap-1.5 bg-black/80 p-1.5 rounded-lg border border-white/10">
         <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">🎬 Clipe 30s</button>
         <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
         <button onClick={onMute} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
-          {streamObj.muted ? '🔇 Ativar Som' : '🔊 Áudio'}
+          {streamObj.muted ? '🔇 Mutado' : '🔊 Áudio'}
         </button>
         <button onClick={onMinimize} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">_ Minimizar</button>
         <button onClick={onExpand} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">

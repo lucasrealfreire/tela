@@ -15,23 +15,12 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 1e6
+  maxHttpBufferSize: 5e6,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
-// Estado real das salas em memória
-// Estrutura: rooms[roomName] = { users: { socketId: { id, nick, cheers, connType } } }
 const rooms = new Map();
-const rateLimitMap = new Map();
-
-function checkRateLimit(socketId) {
-  const now = Date.now();
-  const history = rateLimitMap.get(socketId) || [];
-  const recent = history.filter(t => now - t < 3000);
-  if (recent.length >= 12) return false;
-  recent.push(now);
-  rateLimitMap.set(socketId, recent);
-  return true;
-}
 
 io.on('connection', (socket) => {
   let currentRoom = null;
@@ -52,26 +41,45 @@ io.on('connection', (socket) => {
       id: socket.id,
       nick: cleanNick,
       cheers: 0,
-      conn: 'IPv6 / STUN'
+      conn: 'Conectado'
     });
 
-    // Envia lista atualizada de participantes para todos na sala
     io.to(cleanRoom).emit('room-users', Array.from(roomUsers.values()));
 
-    // Avisa os demais membros que um novo participante entrou (para disparar ofertas WebRTC)
+    // Notifica quem já estava na sala para enviar suas telas para quem acabou de entrar
     socket.to(cleanRoom).emit('user-joined', {
       id: socket.id,
       nick: cleanNick
     });
   });
 
-  // Sinalização WebRTC (Offer, Answer e Trickle ICE Candidates IPv6/IPv4/TURN)
+  // Permite que qualquer cliente peça novamente as ofertas de quem está transmitindo
+  socket.on('request-streams', () => {
+    if (currentRoom) {
+      socket.to(currentRoom).emit('user-joined', {
+        id: socket.id,
+        nick: 'Participante'
+      });
+    }
+  });
+
+  // Sinalização WebRTC P2P / TURN
   socket.on('webrtc-signal', ({ targetId, signal, streamMeta }) => {
     io.to(targetId).emit('webrtc-signal', {
       senderId: socket.id,
       signal,
       streamMeta
     });
+  });
+
+  // PLANO B GARANTIDO: Retransmissão de quadros em baixa latência via WebSocket caso o CGNAT bloqueie o UDP/WebRTC
+  socket.on('relay-frame', (payload) => {
+    if (currentRoom) {
+      socket.volatile.to(currentRoom).emit('relay-frame', {
+        senderId: socket.id,
+        ...payload
+      });
+    }
   });
 
   socket.on('stop-stream', ({ streamId }) => {
@@ -95,18 +103,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat-message', ({ text }) => {
-    if (!currentRoom || !checkRateLimit(socket.id)) return;
+    if (!currentRoom) return;
     const roomUsers = rooms.get(currentRoom);
     const sender = roomUsers?.get(socket.id);
     if (!sender || !text || !String(text).trim()) return;
 
-    const msgPayload = {
+    io.to(currentRoom).emit('chat-message', {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       sender: sender.nick,
       text: String(text).trim().slice(0, 500),
       time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
-    };
-    io.to(currentRoom).emit('chat-message', msgPayload);
+    });
   });
 
   socket.on('send-cheer', () => {
@@ -120,7 +127,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    rateLimitMap.delete(socket.id);
     if (currentRoom && rooms.has(currentRoom)) {
       const roomUsers = rooms.get(currentRoom);
       roomUsers.delete(socket.id);
@@ -134,7 +140,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Serve o frontend compilado em produção (Render)
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
 app.get('*', (req, res) => {
@@ -142,6 +147,6 @@ app.get('*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, '::', () => {
-  console.log(`[TELINHA SERVER] Rodando em Dual-Stack IPv6/IPv4 na porta ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[TELINHA SERVER] Ativo na porta ${PORT}`);
 });
