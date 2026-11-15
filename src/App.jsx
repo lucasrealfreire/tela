@@ -1,25 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { io } from 'socket.io-client';
 
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  {
-    urls: [
-      'turn:openrelay.metered.ca:80',
-      'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp',
-      'turns:openrelay.metered.ca:443?transport=tcp'
-    ],
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  }
-];
+const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
 
 const RES_CONFIG = {
-  '720p': { width: 1280, height: 720, bitrate: 2200000, label: '720p' },
-  '1080p': { width: 1920, height: 1080, bitrate: 4000000, label: '1080p' },
-  '1440p': { width: 2560, height: 1440, bitrate: 6500000, label: '2K (1440p)' }
+  '720p': { width: 1280, height: 720, bitrate: 3000000, label: '720p' },
+  '1080p': { width: 1920, height: 1080, bitrate: 5500000, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, bitrate: 8500000, label: '2K (1440p)' }
 };
 
 function VogelsLogo({ size = 'text-sm' }) {
@@ -45,13 +32,33 @@ function parseRoomInput(rawRoom, rawPass) {
       if (u.searchParams.get('senha') && !p) p = u.searchParams.get('senha');
     } catch (e) {}
   }
-  const cleanRoom = r.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32) || 'squad-brasil';
-  const cleanPass = p.toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 20);
+  const cleanRoom = r.toLowerCase().replace(/\s+/g, '-').slice(0, 40) || 'squad-brasil';
+  const cleanPass = p.toLowerCase().slice(0, 30);
   return {
     cleanRoom,
     cleanPass,
-    hostPeerId: `vtv-room-${cleanRoom}${cleanPass ? '-' + cleanPass : ''}`
+    fullRoomKey: cleanPass ? `${cleanRoom}::pass:${cleanPass}` : cleanRoom
   };
+}
+
+// Empacota cabeçalho JSON + ArrayBuffer binário num único frame WebSocket (para o Cloudflare Worker)
+function packBinaryFrame(headerObj, payloadBuffer) {
+  const headerBytes = new TextEncoder().encode(JSON.stringify(headerObj));
+  const payloadBytes = new Uint8Array(payloadBuffer);
+  const combined = new Uint8Array(4 + headerBytes.byteLength + payloadBytes.byteLength);
+  new DataView(combined.buffer).setUint32(0, headerBytes.byteLength, false);
+  combined.set(headerBytes, 4);
+  combined.set(payloadBytes, 4 + headerBytes.byteLength);
+  return combined.buffer;
+}
+
+function unpackBinaryFrame(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  const headerLen = view.getUint32(0, false);
+  const headerBytes = new Uint8Array(arrayBuffer, 4, headerLen);
+  const headerObj = JSON.parse(new TextDecoder().decode(headerBytes));
+  const payloadBuffer = arrayBuffer.slice(4 + headerLen);
+  return { headerObj, payloadBuffer };
 }
 
 async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
@@ -101,7 +108,7 @@ function createRolling30sBuffer(getStreamFn) {
       const s = getStreamFn();
       if (!s || !s.getVideoTracks().length) return;
       const videoOnly = new MediaStream([s.getVideoTracks()[0]]);
-      const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 3000000 });
+      const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 3500000 });
       const slot = { rec, chunks: [], startTime: Date.now(), mimeType };
 
       rec.ondataavailable = (e) => {
@@ -202,7 +209,7 @@ export default function App() {
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
 
-  const [myPeerId, setMyPeerId] = useState('');
+  const [myId, setMyId] = useState('local-me');
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
@@ -211,13 +218,17 @@ export default function App() {
   ]);
   const [chatInput, setChatInput] = useState('');
 
-  // Refs do Motor Serverless P2P Mesh (Funciona em .workers.dev, .pages.dev e Render sem precisar de backend!)
-  const peerRef = useRef(null);
-  const isHostRef = useRef(false);
-  const dataConnsRef = useRef(new Map()); // peerId -> DataConnection
-  const roomUsersMapRef = useRef(new Map()); // peerId -> { id, nick }
-  const activeStreamsMapRef = useRef(new Map()); // streamId -> meta
-  const localStreamsRef = useRef([]);
+  // Transporte híbrido: funciona com Cloudflare Native WebSocket (/ws) OU com Socket.IO do Render!
+  const transportRef = useRef({
+    mode: 'none', // 'cf-ws' ou 'socketio'
+    ws: null,
+    socket: null,
+    sendControl: () => {},
+    sendVideoChunk: () => {},
+    sendAudioChunk: () => {},
+    getBufferedAmount: () => 0
+  });
+
   const activeEncodersRef = useRef({});
   const videoChunkHandlersRef = useRef({});
   const audioChunkHandlersRef = useRef({});
@@ -259,251 +270,79 @@ export default function App() {
     localStorage.setItem('tv_nick', nickname);
   }, [nickname]);
 
-  // Envia mensagem de controle ou binário para todos os participantes conectados na malha WebRTC
-  const broadcastPacket = (packet, excludePeerId = null) => {
-    dataConnsRef.current.forEach((conn, pid) => {
-      if (pid !== excludePeerId && conn && conn.open) {
-        try { conn.send(packet); } catch (e) {}
-      }
-    });
-  };
-
-  const syncRoomStateFromHost = () => {
-    if (!isHostRef.current) return;
-    const usersArray = Array.from(roomUsersMapRef.current.values());
-    const streamsArray = Array.from(activeStreamsMapRef.current.values());
-    setParticipants(usersArray);
-    broadcastPacket({
-      type: 'room-sync',
-      users: usersArray,
-      streams: streamsArray
-    });
-  };
-
-  // Inicializa a Sala Serverless P2P (PeerJS Cloud + WebRTC DataChannel & MediaChannel)
+  // Conecta na sala exatamente com a mesma lógica que funcionava no Render!
   useEffect(() => {
-    if (!inRoom || !window.Peer) return;
+    if (!inRoom) return;
 
-    const { hostPeerId } = parseRoomInput(roomName, roomPassword);
-    let destroyed = false;
-    let currentPeer = null;
+    const { cleanRoom, cleanPass, fullRoomKey } = parseRoomInput(roomName, roomPassword);
+    // Garante que você mesmo apareça na lista de participantes na mesma hora em que entra
+    setParticipants([{ id: 'local-me', nick: nickname }]);
 
-    const handleIncomingPacket = (pkt, fromPeerId) => {
-      if (!pkt || typeof pkt !== 'object') return;
+    let isUnmounted = false;
+    let cfWs = null;
+    let fallbackSocket = null;
 
-      if (pkt.type === 'join-request' && isHostRef.current) {
-        roomUsersMapRef.current.set(fromPeerId, { id: fromPeerId, nick: pkt.nick || 'Amigo' });
-        syncRoomStateFromHost();
-        // Envia as streams locais do Host para quem acabou de entrar
-        localStreamsRef.current.forEach(ls => {
-          try {
-            currentPeer.call(fromPeerId, ls.stream, {
-              metadata: {
-                streamId: ls.id,
-                senderId: currentPeer.id,
-                owner: nickname,
-                type: ls.type,
-                res: ls.res,
-                fps: ls.fps
-              }
-            });
-          } catch (e) {}
-        });
-        Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
-      } else if (pkt.type === 'room-sync') {
-        if (Array.isArray(pkt.users)) {
-          setParticipants(pkt.users);
-          // Conecta diretamente aos demais membros da sala (Mesh completa)
-          pkt.users.forEach(u => {
-            if (u.id !== currentPeer.id && !dataConnsRef.current.has(u.id)) {
-              const c = currentPeer.connect(u.id, { reliable: true });
-              setupDataConnection(c);
-            }
-          });
-        }
-        if (Array.isArray(pkt.streams)) {
-          handleActiveStreamsList(pkt.streams, currentPeer.id);
-        }
-      } else if (pkt.type === 'start-stream') {
-        if (isHostRef.current) {
-          activeStreamsMapRef.current.set(pkt.meta.streamId, pkt.meta);
-          syncRoomStateFromHost();
-        }
-        handleStreamStarted(pkt.meta, currentPeer.id);
-      } else if (pkt.type === 'stop-stream') {
-        if (isHostRef.current) {
-          activeStreamsMapRef.current.delete(pkt.streamId);
-          syncRoomStateFromHost();
-        }
-        stoppedWatchingSetRef.current.delete(pkt.streamId);
-        clipManagersRef.current[pkt.streamId]?.destroy?.();
-        delete clipManagersRef.current[pkt.streamId];
-        setStreams(prev => prev.filter(s => s.id !== pkt.streamId));
-      } else if (pkt.type === 'chat-message') {
-        setMessages(prev => prev.some(m => m.id === pkt.msg.id) ? prev : [...prev, pkt.msg]);
-        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
-      } else if (pkt.type === 'request-keyframe') {
-        Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
-        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
-      } else if (pkt.type === 'v-chunk') {
-        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
-        if (!stoppedWatchingSetRef.current.has(pkt.meta.id)) {
-          const handler = videoChunkHandlersRef.current[pkt.meta.id];
-          if (handler) handler(pkt.meta, pkt.buffer);
-        }
-      } else if (pkt.type === 'a-chunk') {
-        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
-        if (!stoppedWatchingSetRef.current.has(pkt.meta.id)) {
-          const handler = audioChunkHandlersRef.current[pkt.meta.id];
-          if (handler) handler(pkt.meta, pkt.buffer);
-        }
-      }
+    const onRoomUsers = (list) => {
+      if (isUnmounted) return;
+      setParticipants(list && list.length ? list : [{ id: 'local-me', nick: nickname }]);
     };
 
-    const setupDataConnection = (conn) => {
-      if (!conn) return;
-      conn.on('open', () => {
-        dataConnsRef.current.set(conn.peer, conn);
-        if (!isHostRef.current && conn.peer === hostPeerId) {
-          conn.send({ type: 'join-request', nick: nickname });
-        }
-        // Se estamos transmitindo tela, liga chamada WebRTC de vídeo direto para este par
-        localStreamsRef.current.forEach(ls => {
-          try {
-            currentPeer.call(conn.peer, ls.stream, {
-              metadata: {
-                streamId: ls.id,
-                senderId: currentPeer.id,
-                owner: nickname,
-                type: ls.type,
-                res: ls.res,
-                fps: ls.fps
-              }
+    const onActiveStreams = (list, currentSelfId) => {
+      if (isUnmounted || !Array.isArray(list)) return;
+      setStreams(prev => {
+        const localOnes = prev.filter(s => s.isLocal);
+        const updatedRemotes = [];
+
+        list.forEach(st => {
+          if (st.senderId === currentSelfId) return;
+          const existing = prev.find(p => p.id === st.streamId);
+          if (existing) {
+            updatedRemotes.push({
+              ...existing,
+              senderId: st.senderId,
+              owner: st.owner,
+              res: st.res,
+              fps: st.fps
             });
-          } catch (e) {}
-        });
-      });
-
-      conn.on('data', (data) => handleIncomingPacket(data, conn.peer));
-
-      const handleDisconnect = () => {
-        dataConnsRef.current.delete(conn.peer);
-        if (isHostRef.current) {
-          roomUsersMapRef.current.delete(conn.peer);
-          for (const [sId, sMeta] of activeStreamsMapRef.current.entries()) {
-            if (sMeta.senderId === conn.peer) {
-              activeStreamsMapRef.current.delete(sId);
-              broadcastPacket({ type: 'stop-stream', streamId: sId });
-              setStreams(prev => prev.filter(s => s.id !== sId));
-            }
+          } else {
+            const isStopped = stoppedWatchingSetRef.current.has(st.streamId);
+            updatedRemotes.push({
+              id: st.streamId,
+              senderId: st.senderId,
+              owner: st.owner,
+              type: st.type,
+              res: st.res,
+              fps: st.fps,
+              volume: 75,
+              muted: false,
+              minimized: false,
+              watching: !isStopped,
+              watchSession: 1,
+              isLocal: false
+            });
           }
-          syncRoomStateFromHost();
-        }
-      };
-
-      conn.on('close', handleDisconnect);
-      conn.on('error', handleDisconnect);
-    };
-
-    const bindPeerEvents = (peer, asHost) => {
-      currentPeer = peer;
-      peerRef.current = peer;
-      isHostRef.current = asHost;
-
-      peer.on('open', (id) => {
-        if (destroyed) return;
-        setMyPeerId(id);
-        if (asHost) {
-          roomUsersMapRef.current.set(id, { id, nick: nickname });
-          setParticipants([{ id, nick: nickname }]);
-        } else {
-          // Conecta ao Host da sala
-          const hostConn = peer.connect(hostPeerId, { reliable: true });
-          setupDataConnection(hostConn);
-        }
-      });
-
-      peer.on('connection', (conn) => {
-        setupDataConnection(conn);
-      });
-
-      peer.on('call', (call) => {
-        call.answer();
-        call.on('stream', (remoteMediaStream) => {
-          const meta = call.metadata || {};
-          if (!meta.streamId) return;
-          setStreams(prev => {
-            const exists = prev.find(s => s.id === meta.streamId);
-            if (exists) {
-              return prev.map(s => s.id === meta.streamId ? { ...s, p2pStream: remoteMediaStream } : s);
-            }
-            const isStopped = stoppedWatchingSetRef.current.has(meta.streamId);
-            return [
-              ...prev,
-              {
-                id: meta.streamId,
-                senderId: meta.senderId,
-                owner: meta.owner || 'Participante',
-                type: meta.type || 'Tela',
-                res: meta.res || '1080p',
-                fps: meta.fps || 60,
-                p2pStream: remoteMediaStream,
-                volume: 75,
-                muted: false,
-                minimized: false,
-                watching: !isStopped,
-                watchSession: 1,
-                isLocal: false
-              }
-            ];
-          });
         });
-      });
 
-      peer.on('error', (err) => {
-        // Se o ID de Host já estiver ocupado na sala, entra automaticamente como Cliente conectado ao Host!
-        if (asHost && err.type === 'unavailable-id') {
-          try { peer.destroy(); } catch (e) {}
-          const clientPeer = new window.Peer(undefined, { config: { iceServers: ICE_SERVERS } });
-          bindPeerEvents(clientPeer, false);
+        return [...localOnes, ...updatedRemotes];
+      });
+    };
+
+    const onStreamStarted = (st, currentSelfId) => {
+      if (isUnmounted || !st || st.senderId === currentSelfId) return;
+      stoppedWatchingSetRef.current.delete(st.streamId);
+
+      setStreams(prev => {
+        const exists = prev.find(s => s.id === st.streamId);
+        if (exists) {
+          return prev.map(s =>
+            s.id === st.streamId
+              ? { ...s, senderId: st.senderId, watching: true, minimized: false, watchSession: (s.watchSession || 0) + 1 }
+              : s
+          );
         }
-      });
-    };
-
-    // Tenta iniciar como Host da sala; se já houver alguém na sala, entra como Cliente
-    const initialPeer = new window.Peer(hostPeerId, { config: { iceServers: ICE_SERVERS } });
-    bindPeerEvents(initialPeer, true);
-
-    return () => {
-      destroyed = true;
-      Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
-      Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
-      dataConnsRef.current.clear();
-      roomUsersMapRef.current.clear();
-      activeStreamsMapRef.current.clear();
-      try { if (currentPeer) currentPeer.destroy(); } catch (e) {}
-    };
-  }, [inRoom, roomName, roomPassword, nickname]);
-
-  const handleActiveStreamsList = (list, selfId) => {
-    setStreams(prev => {
-      const localOnes = prev.filter(s => s.isLocal);
-      const updatedRemotes = [];
-
-      list.forEach(st => {
-        if (st.senderId === selfId) return;
-        const existing = prev.find(p => p.id === st.streamId);
-        if (existing) {
-          updatedRemotes.push({
-            ...existing,
-            senderId: st.senderId,
-            owner: st.owner,
-            res: st.res,
-            fps: st.fps
-          });
-        } else {
-          const isStopped = stoppedWatchingSetRef.current.has(st.streamId);
-          updatedRemotes.push({
+        return [
+          ...prev,
+          {
             id: st.streamId,
             senderId: st.senderId,
             owner: st.owner,
@@ -513,50 +352,201 @@ export default function App() {
             volume: 75,
             muted: false,
             minimized: false,
+            watching: true,
+            watchSession: 1,
+            isLocal: false
+          }
+        ];
+      });
+      transportRef.current.sendControl('request-keyframe', { streamId: st.streamId });
+    };
+
+    const onVChunk = (meta, buffer) => {
+      if (isUnmounted) return;
+      setStreams(prev => {
+        if (prev.some(s => s.id === meta.id)) return prev;
+        const isStopped = stoppedWatchingSetRef.current.has(meta.id);
+        return [
+          ...prev,
+          {
+            id: meta.id,
+            senderId: meta.senderId,
+            owner: meta.owner || 'Participante',
+            type: 'Tela',
+            res: `${meta.h}p`,
+            fps: meta.fps || 60,
+            volume: 75,
+            muted: false,
+            minimized: false,
             watching: !isStopped,
             watchSession: 1,
             isLocal: false
-          });
-        }
+          }
+        ];
       });
 
-      return [...localOnes, ...updatedRemotes];
-    });
-  };
+      if (stoppedWatchingSetRef.current.has(meta.id)) return;
+      const handler = videoChunkHandlersRef.current[meta.id];
+      if (handler) handler(meta, buffer);
+    };
 
-  const handleStreamStarted = (st, selfId) => {
-    if (st.senderId === selfId) return;
-    stoppedWatchingSetRef.current.delete(st.streamId);
+    const onAChunk = (meta, buffer) => {
+      if (isUnmounted || stoppedWatchingSetRef.current.has(meta.id)) return;
+      const handler = audioChunkHandlersRef.current[meta.id];
+      if (handler) handler(meta, buffer);
+    };
 
-    setStreams(prev => {
-      const exists = prev.find(s => s.id === st.streamId);
-      if (exists) {
-        return prev.map(s =>
-          s.id === st.streamId
-            ? { ...s, senderId: st.senderId, watching: true, minimized: false, watchSession: (s.watchSession || 0) + 1 }
-            : s
-        );
-      }
-      return [
-        ...prev,
-        {
-          id: st.streamId,
-          senderId: st.senderId,
-          owner: st.owner,
-          type: st.type,
-          res: st.res,
-          fps: st.fps,
-          volume: 75,
-          muted: false,
-          minimized: false,
-          watching: true,
-          watchSession: 1,
-          isLocal: false
+    const onPeerStoppedStream = (streamId) => {
+      if (isUnmounted) return;
+      stoppedWatchingSetRef.current.delete(streamId);
+      clipManagersRef.current[streamId]?.destroy?.();
+      delete clipManagersRef.current[streamId];
+      setStreams(prev => prev.filter(s => s.id !== streamId));
+      delete videoChunkHandlersRef.current[streamId];
+      delete audioChunkHandlersRef.current[streamId];
+    };
+
+    // 1. Tenta conectar primeiro no WebSocket nativo da própria Cloudflare (/ws)
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}`;
+
+    let cfConnected = false;
+    try {
+      cfWs = new WebSocket(wsUrl);
+      cfWs.binaryType = 'arraybuffer';
+
+      cfWs.onopen = () => {
+        if (isUnmounted) return;
+        cfConnected = true;
+        transportRef.current = {
+          mode: 'cf-ws',
+          ws: cfWs,
+          socket: null,
+          sendControl: (type, payload = {}) => {
+            if (cfWs.readyState === 1) {
+              cfWs.send(JSON.stringify({ type, ...payload }));
+            }
+          },
+          sendVideoChunk: (meta, buffer) => {
+            if (cfWs.readyState === 1) {
+              cfWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
+            }
+          },
+          sendAudioChunk: (meta, buffer) => {
+            if (cfWs.readyState === 1) {
+              cfWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
+            }
+          },
+          getBufferedAmount: () => cfWs.bufferedAmount || 0
+        };
+
+        cfWs.send(JSON.stringify({
+          type: 'join-room',
+          roomName: cleanRoom,
+          roomPassword: cleanPass,
+          nickname
+        }));
+      };
+
+      cfWs.onmessage = (event) => {
+        if (isUnmounted) return;
+        if (event.data instanceof ArrayBuffer) {
+          const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
+          if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
+          else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
+          return;
         }
-      ];
-    });
-    broadcastPacket({ type: 'request-keyframe', streamId: st.streamId });
-  };
+        const data = JSON.parse(event.data);
+        if (data.type === 'welcome') {
+          setMyId(data.id);
+        } else if (data.type === 'room-users') {
+          onRoomUsers(data.users);
+        } else if (data.type === 'active-streams') {
+          onActiveStreams(data.streams, myId);
+        } else if (data.type === 'stream-started') {
+          onStreamStarted(data.stream, myId);
+        } else if (data.type === 'force-keyframe') {
+          Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+        } else if (data.type === 'peer-stopped-stream') {
+          onPeerStoppedStream(data.streamId);
+        } else if (data.type === 'chat-message') {
+          setMessages(prev => [...prev, data.msg]);
+        }
+      };
+
+      cfWs.onerror = () => {
+        if (!cfConnected && !fallbackSocket && !isUnmounted) {
+          startSocketIoFallback();
+        }
+      };
+
+      cfWs.onclose = () => {
+        if (!cfConnected && !fallbackSocket && !isUnmounted) {
+          startSocketIoFallback();
+        }
+      };
+    } catch (e) {
+      startSocketIoFallback();
+    }
+
+    // 2. Fallback automático para Socket.IO (caso esteja rodando em localhost ou Render)
+    function startSocketIoFallback() {
+      if (isUnmounted || fallbackSocket) return;
+      const targetServer = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+        ? window.location.origin
+        : MASTER_RENDER_URL;
+
+      const socket = io(targetServer, {
+        transports: ['websocket', 'polling'],
+        reconnection: true
+      });
+      fallbackSocket = socket;
+
+      transportRef.current = {
+        mode: 'socketio',
+        ws: null,
+        socket,
+        sendControl: (type, payload = {}) => {
+          socket.emit(type, payload);
+        },
+        sendVideoChunk: (meta, buffer) => {
+          socket.emit('v-chunk', meta, buffer);
+        },
+        sendAudioChunk: (meta, buffer) => {
+          socket.emit('a-chunk', meta, buffer);
+        },
+        getBufferedAmount: () => socket.io?.engine?.transport?.ws?.bufferedAmount || 0
+      };
+
+      socket.on('connect', () => {
+        setMyId(socket.id);
+        socket.emit('join-room', {
+          roomName: cleanRoom,
+          roomPassword: cleanPass,
+          nickname
+        });
+      });
+
+      socket.on('room-users', (list) => onRoomUsers(list));
+      socket.on('active-streams', (list) => onActiveStreams(list, socket.id));
+      socket.on('stream-started', (st) => onStreamStarted(st, socket.id));
+      socket.on('force-keyframe', () => {
+        Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+      });
+      socket.on('v-chunk', (meta, buffer) => onVChunk(meta, buffer));
+      socket.on('a-chunk', (meta, buffer) => onAChunk(meta, buffer));
+      socket.on('peer-stopped-stream', ({ streamId }) => onPeerStoppedStream(streamId));
+      socket.on('chat-message', (msg) => setMessages(prev => [...prev, msg]));
+    }
+
+    return () => {
+      isUnmounted = true;
+      Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
+      Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
+      try { if (cfWs) cfWs.close(); } catch (e) {}
+      try { if (fallbackSocket) fallbackSocket.disconnect(); } catch (e) {}
+    };
+  }, [inRoom, roomName, roomPassword, nickname]);
 
   const setStreamVolume = (streamId, newVol) => {
     const clamped = Math.max(0, Math.min(100, Number(newVol)));
@@ -601,7 +591,7 @@ export default function App() {
     );
 
     if (shouldWatch) {
-      broadcastPacket({ type: 'request-keyframe', streamId });
+      transportRef.current.sendControl('request-keyframe', { streamId });
     }
   };
 
@@ -617,10 +607,10 @@ export default function App() {
     }
   };
 
-  // Envia também via WebCodecs pelo DataChannel P2P para garantir imagem mesmo se a chamada de mídia WebRTC sofrer bloqueio
+  // EXATAMENTE o mesmo motor WebCodecs que funcionou no Render!
   const startWebCodecsSender = async (streamId, mediaStream, isCamera = false) => {
     const vTrack = mediaStream.getVideoTracks()[0];
-    if (!vTrack || !('VideoEncoder' in window)) return;
+    if (!vTrack) return;
 
     let running = true;
     let forceKey = true;
@@ -635,21 +625,17 @@ export default function App() {
         const buf = new Uint8Array(chunk.byteLength);
         chunk.copyTo(buf);
 
-        broadcastPacket({
-          type: 'v-chunk',
-          meta: {
-            id: streamId,
-            senderId: peerRef.current?.id,
-            owner: nickname,
-            c: currentCodecStr,
-            t: chunk.type,
-            ts: chunk.timestamp,
-            w: targetW,
-            h: targetH,
-            fps: fpsRef.current
-          },
-          buffer: buf.buffer
-        });
+        transportRef.current.sendVideoChunk({
+          id: streamId,
+          senderId: myId,
+          owner: nickname,
+          c: currentCodecStr,
+          t: chunk.type,
+          ts: chunk.timestamp,
+          w: targetW,
+          h: targetH,
+          fps: fpsRef.current
+        }, buf.buffer);
       },
       error: () => {}
     });
@@ -684,21 +670,17 @@ export default function App() {
             if (!running) return;
             const buf = new Uint8Array(chunk.byteLength);
             chunk.copyTo(buf);
-            broadcastPacket({
-              type: 'a-chunk',
-              meta: {
-                id: streamId,
-                ts: chunk.timestamp,
-                sr: 48000,
-                ch: 2,
-                gain: outgoingVolumeRef.current
-              },
-              buffer: buf.buffer
-            });
+            transportRef.current.sendAudioChunk({
+              id: streamId,
+              ts: chunk.timestamp,
+              sr: 48000,
+              ch: 2,
+              gain: outgoingVolumeRef.current
+            }, buf.buffer);
           },
           error: () => {}
         });
-        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 96000 });
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
         const aProc = new MediaStreamTrackProcessor({ track: aTrack });
         const aReader = aProc.readable.getReader();
         (async () => {
@@ -725,12 +707,13 @@ export default function App() {
 
           const now = performance.now();
           const minInterval = 1000 / (Number(fpsRef.current) + 2);
+          const netBusy = transportRef.current.getBufferedAmount() > 400000;
 
           if (now - lastFrameTime < minInterval) {
             frame.close();
             continue;
           }
-          if (videoEncoder.encodeQueueSize > 2) {
+          if (videoEncoder.encodeQueueSize > 2 || netBusy) {
             droppedFrame = true;
             frame.close();
             continue;
@@ -796,10 +779,9 @@ export default function App() {
       const newId = 'stream_' + Math.random().toString(36).substring(2, 9);
       vTrack.onended = () => stopStream(newId);
 
-      const selfId = peerRef.current?.id || 'local';
       const newStreamObj = {
         id: newId,
-        senderId: selfId,
+        senderId: myId,
         owner: nickname,
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
@@ -813,31 +795,21 @@ export default function App() {
         isLocal: true
       };
 
-      localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
 
-      const streamMeta = {
+      const meta = {
         streamId: newId,
-        senderId: selfId,
+        senderId: myId,
         owner: nickname,
         type: newStreamObj.type,
         res: cfg.label,
         fps: targetFps
       };
 
-      if (isHostRef.current) {
-        activeStreamsMapRef.current.set(newId, streamMeta);
-        syncRoomStateFromHost();
-      }
-      broadcastPacket({ type: 'start-stream', meta: streamMeta });
-
-      // Liga chamada WebRTC de vídeo direto para todos os participantes na sala
-      if (peerRef.current) {
-        dataConnsRef.current.forEach((_, pid) => {
-          try {
-            peerRef.current.call(pid, mediaStream, { metadata: streamMeta });
-          } catch (e) {}
-        });
+      if (transportRef.current.mode === 'cf-ws') {
+        transportRef.current.sendControl('start-stream', { meta });
+      } else {
+        transportRef.current.sendControl('start-stream', meta);
       }
 
       await startWebCodecsSender(newId, mediaStream, false);
@@ -854,10 +826,9 @@ export default function App() {
       const vTrack = mediaStream.getVideoTracks()[0];
       vTrack.onended = () => stopStream(newId);
 
-      const selfId = peerRef.current?.id || 'local';
       const newStreamObj = {
         id: newId,
-        senderId: selfId,
+        senderId: myId,
         owner: nickname,
         type: 'Câmera',
         stream: mediaStream,
@@ -871,30 +842,21 @@ export default function App() {
         isLocal: true
       };
 
-      localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
 
-      const streamMeta = {
+      const meta = {
         streamId: newId,
-        senderId: selfId,
+        senderId: myId,
         owner: nickname,
         type: 'Câmera',
         res: '720p',
         fps: Number(fps)
       };
 
-      if (isHostRef.current) {
-        activeStreamsMapRef.current.set(newId, streamMeta);
-        syncRoomStateFromHost();
-      }
-      broadcastPacket({ type: 'start-stream', meta: streamMeta });
-
-      if (peerRef.current) {
-        dataConnsRef.current.forEach((_, pid) => {
-          try {
-            peerRef.current.call(pid, mediaStream, { metadata: streamMeta });
-          } catch (e) {}
-        });
+      if (transportRef.current.mode === 'cf-ws') {
+        transportRef.current.sendControl('start-stream', { meta });
+      } else {
+        transportRef.current.sendControl('start-stream', meta);
       }
 
       await startWebCodecsSender(newId, mediaStream, true);
@@ -908,7 +870,6 @@ export default function App() {
     delete activeEncodersRef.current[streamId];
     clipManagersRef.current[streamId]?.destroy?.();
     delete clipManagersRef.current[streamId];
-    localStreamsRef.current = localStreamsRef.current.filter(s => s.id !== streamId);
 
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
@@ -916,11 +877,7 @@ export default function App() {
       return prev.filter(s => s.id !== streamId);
     });
 
-    if (isHostRef.current) {
-      activeStreamsMapRef.current.delete(streamId);
-      syncRoomStateFromHost();
-    }
-    broadcastPacket({ type: 'stop-stream', streamId });
+    transportRef.current.sendControl('stop-stream', { streamId });
     if (expandedId === streamId) setExpandedId(null);
   };
 
@@ -963,39 +920,23 @@ export default function App() {
     }
   };
 
-  // Gera e baixa o Launcher Desktop Windows (.cmd) que NÃO sofre bloqueio de vírus no Chrome nem no Windows Defender
+  // Cria um Atalho Nativo do Windows (.url) / App Mode que o Google Chrome e o Windows NUNCA bloqueiam como vírus!
   const downloadSafeDesktopApp = () => {
     const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
     const targetUrl = `${window.location.origin}/?desktop=1&sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
 
-    const launcherScript = [
-      '@echo off',
-      'chcp 65001 >nul',
-      'title VogelsTV Desktop',
-      'set "APP_URL=' + targetUrl + '"',
-      'set "PROFILE_DIR=%LOCALAPPDATA%\\VogelsTV\\AppProfile"',
-      'if not exist "%PROFILE_DIR%" mkdir "%PROFILE_DIR%"',
-      '',
-      'set "BROWSER="',
-      'if exist "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe" set "BROWSER=%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe"',
-      'if exist "%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe" set "BROWSER=%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe"',
-      'if exist "%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe" set "BROWSER=%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"',
-      'if "%BROWSER%"=="" if exist "%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe" set "BROWSER=%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe"',
-      'if "%BROWSER%"=="" if exist "%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe" set "BROWSER=%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe"',
-      '',
-      'if not "%BROWSER%"=="" (',
-      '  start "" "%BROWSER%" --app="%APP_URL%" --user-data-dir="%PROFILE_DIR%" --enable-features=ApplicationAudioCaptureWin,AudioServiceOutOfProcess --autoplay-policy=no-user-gesture-required',
-      ') else (',
-      '  start "" "%APP_URL%"',
-      ')',
-      'exit'
+    const shortcutContent = [
+      '[InternetShortcut]',
+      `URL=${targetUrl}`,
+      'IconIndex=18',
+      'IconFile=C:\\Windows\\System32\\shell32.dll'
     ].join('\r\n');
 
-    const blob = new Blob([launcherScript], { type: 'application/octet-stream' });
+    const blob = new Blob([shortcutContent], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'VogelsTV-Desktop.cmd';
+    a.download = 'VogelsTV Desktop.url';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1005,14 +946,7 @@ export default function App() {
   const sendChat = (e) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
-    const msgPayload = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      sender: nickname,
-      text: chatInput.trim().slice(0, 500),
-      time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
-    };
-    setMessages(prev => [...prev, msgPayload]);
-    broadcastPacket({ type: 'chat-message', msg: msgPayload });
+    transportRef.current.sendControl('chat-message', { text: chatInput.trim() });
     setChatInput('');
   };
 
@@ -1108,7 +1042,7 @@ export default function App() {
             {cleanRoom}
           </span>
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-emerald-400 px-2 py-0.5 rounded-full font-medium">
-            {Math.max(1, participants.length)} online
+            {participants.length} online
           </span>
         </div>
 
@@ -1301,7 +1235,7 @@ export default function App() {
           <button
             onClick={downloadSafeDesktopApp}
             className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer"
-            title="Baixar Launcher Desktop Oficial (Sem alerta do Chrome/Windows)"
+            title="Baixar Atalho Oficial VogelsTV (Zero alerta do Chrome/Windows)"
           >
             Baixar app
           </button>
@@ -1366,7 +1300,7 @@ export default function App() {
                     key={`${streamObj.id}_${streamObj.watchSession || 1}`}
                     streamObj={streamObj}
                     masterVolume={masterVolume}
-                    onRequestKeyframe={() => broadcastPacket({ type: 'request-keyframe', streamId: streamObj.id })}
+                    onRequestKeyframe={() => transportRef.current.sendControl('request-keyframe', { streamId: streamObj.id })}
                     videoChunkHandlersRef={videoChunkHandlersRef}
                     audioChunkHandlersRef={audioChunkHandlersRef}
                     clipManagersRef={clipManagersRef}
@@ -1415,7 +1349,7 @@ export default function App() {
               </div>
               <div className="space-y-1.5">
                 {participants.map(p => {
-                  const isMe = p.id === myPeerId;
+                  const isMe = p.id === myId || p.id === 'local-me';
                   const userStreams = streams.filter(
                     s => (s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)
                   );
@@ -1571,11 +1505,9 @@ function VideoTile({
   onReplay
 }) {
   const localVideoRef = useRef(null);
-  const remoteP2PVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
-  const [p2pActive, setP2pActive] = useState(false);
 
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimerRef = useRef(null);
@@ -1609,41 +1541,13 @@ function VideoTile({
     volumeRef.current = streamObj.volume ?? 75;
     masterVolRef.current = masterVolume ?? 80;
 
-    const effectiveGain = streamObj.muted
-      ? 0
-      : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
-
     if (gainNodeRef.current) {
+      const effectiveGain = streamObj.muted
+        ? 0
+        : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
       gainNodeRef.current.gain.value = effectiveGain;
     }
-    if (remoteP2PVideoRef.current) {
-      remoteP2PVideoRef.current.muted = streamObj.muted || effectiveGain === 0;
-      remoteP2PVideoRef.current.volume = Math.max(0, Math.min(1, effectiveGain));
-    }
   }, [streamObj.muted, streamObj.volume, masterVolume]);
-
-  useEffect(() => {
-    if (streamObj.isLocal || !streamObj.p2pStream || !remoteP2PVideoRef.current) return;
-    const el = remoteP2PVideoRef.current;
-    el.srcObject = streamObj.p2pStream;
-    el.muted = true;
-    el.play().then(() => {
-      const eff = streamObj.muted ? 0 : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
-      el.muted = streamObj.muted || eff === 0;
-      el.volume = Math.max(0, Math.min(1, eff));
-    }).catch(() => {});
-
-    const timer = setInterval(() => {
-      if (el.videoWidth > 0 && el.readyState >= 2) {
-        setP2pActive(true);
-        if (clipConfig !== 'off' && !clipManagersRef.current[streamObj.id]) {
-          clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => streamObj.p2pStream);
-        }
-      }
-    }, 500);
-
-    return () => clearInterval(timer);
-  }, [streamObj.p2pStream, streamObj.isLocal]);
 
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
@@ -1839,7 +1743,7 @@ function VideoTile({
       if (waitingForKey) {
         onRequestKeyframe?.();
       }
-    }, 500);
+    }, 400);
 
     const statTimer = setInterval(() => {
       const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
@@ -1881,18 +1785,10 @@ function VideoTile({
           className="w-full h-full object-contain bg-black"
         />
       ) : (
-        <>
-          <video
-            ref={remoteP2PVideoRef}
-            autoPlay
-            playsInline
-            className={`w-full h-full object-contain bg-black ${p2pActive ? 'block' : 'hidden'}`}
-          />
-          <canvas
-            ref={remoteCanvasRef}
-            className={`w-full h-full object-contain bg-black ${p2pActive ? 'hidden' : 'block'}`}
-          />
-        </>
+        <canvas
+          ref={remoteCanvasRef}
+          className="w-full h-full object-contain bg-black"
+        />
       )}
 
       <div
@@ -1905,8 +1801,6 @@ function VideoTile({
         <span className="text-emerald-300 font-mono text-[11px]">
           {streamObj.isLocal
             ? `· ${streamObj.res} · ${streamObj.fps} FPS · Local`
-            : p2pActive
-            ? `· ${streamObj.res} · ${streamObj.fps} FPS · P2P Direto`
             : `· ${stats.h ? stats.h + 'p' : streamObj.res} · ${stats.fps} FPS · ${stats.mbps} Mbps`}
         </span>
       </div>
