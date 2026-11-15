@@ -11,9 +11,12 @@ const RES_CONFIG = {
 
 function VogelsLogo({ size = 'text-sm' }) {
   return (
-    <span className={`font-extrabold tracking-tight select-none ${size}`}>
-      <span className="text-white">Vogels</span>
-      <span className="text-red-500">TV</span>
+    <span className={`inline-flex items-center gap-1.5 font-extrabold tracking-tight select-none ${size}`}>
+      <img src="/favicon.svg" alt="VTV" className="w-5 h-5 rounded-sm" />
+      <span>
+        <span className="text-white">Vogels</span>
+        <span className="text-red-500">TV</span>
+      </span>
     </span>
   );
 }
@@ -66,6 +69,93 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
   return { codec: 'vp8', width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
 }
 
+// Motor de Buffer Circular de 30 Segundos (6 gravadores escalonados de 5 em 5s para entregar 30s exatos e 100% reproduzíveis)
+function createRolling30sBuffer(getStreamFn) {
+  let slots = [];
+  let active = true;
+
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+    ? 'video/webm;codecs=vp8'
+    : MediaRecorder.isTypeSupported('video/mp4')
+    ? 'video/mp4'
+    : 'video/webm';
+
+  const spawnRecorderSlot = () => {
+    if (!active) return;
+    try {
+      const s = getStreamFn();
+      if (!s || !s.getVideoTracks().length) return;
+      const videoOnly = new MediaStream([s.getVideoTracks()[0]]);
+      const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 3500000 });
+      const slot = { rec, chunks: [], startTime: Date.now(), mimeType };
+
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) slot.chunks.push(e.data);
+      };
+      rec.start(250);
+      slots.push(slot);
+
+      // Mantém 7 slots escalonados de 5s: o mais antigo sempre tem ~30 segundos exatos de vídeo!
+      while (slots.length > 7) {
+        const old = slots.shift();
+        try { if (old.rec.state !== 'inactive') old.rec.stop(); } catch (e) {}
+      }
+    } catch (e) {}
+  };
+
+  spawnRecorderSlot();
+  const interval = setInterval(spawnRecorderSlot, 5000);
+
+  return {
+    captureLast30s: () => {
+      return new Promise((resolve) => {
+        const validSlots = slots.filter(sl => sl.chunks.length > 0);
+        if (!validSlots.length) return resolve(null);
+
+        const now = Date.now();
+        // Seleciona o slot mais próximo de 30s de duração (ou o mais antigo disponível)
+        let chosen = validSlots[0];
+        for (const sl of validSlots) {
+          const age = (now - sl.startTime) / 1000;
+          if (age >= 25 && age <= 34) {
+            chosen = sl;
+            break;
+          }
+        }
+
+        const finish = () => {
+          const blob = new Blob(chosen.chunks, { type: chosen.mimeType });
+          const durationSec = Math.min(30, Math.round((Date.now() - chosen.startTime) / 1000));
+          resolve({
+            blob,
+            url: URL.createObjectURL(blob),
+            mimeType: chosen.mimeType,
+            durationSec
+          });
+        };
+
+        slots = slots.filter(s => s !== chosen);
+        spawnRecorderSlot();
+
+        if (chosen.rec.state !== 'inactive') {
+          chosen.rec.onstop = finish;
+          try { chosen.rec.stop(); } catch (e) { finish(); }
+        } else {
+          finish();
+        }
+      });
+    },
+    destroy: () => {
+      active = false;
+      clearInterval(interval);
+      slots.forEach(sl => {
+        try { if (sl.rec.state !== 'inactive') sl.rec.stop(); } catch (e) {}
+      });
+      slots = [];
+    }
+  };
+}
+
 export default function App() {
   const [inRoom, setInRoom] = useState(false);
   const [nickname, setNickname] = useState(() => localStorage.getItem('tv_nick') || 'gosadinhas');
@@ -78,8 +168,12 @@ export default function App() {
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showMixer, setShowMixer] = useState(false);
-  const [showLogs, setShowLogs] = useState(false);
-  const [replayClipUrl, setReplayClipUrl] = useState(null);
+
+  // Item 7: Minimizar / Expandir o painel lateral direito (Participantes + Chat)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // Item 4: Modal de Replay de 30 segundos com seletor de qual compartilhamento assistir
+  const [replayModal, setReplayModal] = useState(null); // { streamId, owner, url, mimeType, durationSec }
 
   const [outgoingVolume, setOutgoingVolume] = useState(() => {
     const saved = localStorage.getItem('tv_out_vol');
@@ -100,7 +194,6 @@ export default function App() {
 
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
-  const [clipDuration] = useState(30);
 
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
@@ -109,15 +202,12 @@ export default function App() {
     { id: 'sys-1', system: true, text: 'Sessão criada com senha. Mande o link para a galera!' }
   ]);
   const [chatInput, setChatInput] = useState('');
-  const [logs, setLogs] = useState([]);
 
   const socketRef = useRef(null);
   const activeEncodersRef = useRef({});
   const videoChunkHandlersRef = useRef({});
   const audioChunkHandlersRef = useRef({});
-  const clipRecordersRef = useRef({});
-  const clipChunksRef = useRef({});
-  // Guarda quais streams o usuário clicou em "Parar de assistir" para não reabrir sozinho quando chegar pacote
+  const clipManagersRef = useRef({});
   const stoppedWatchingSetRef = useRef(new Set());
 
   const qualityRef = useRef(quality);
@@ -126,19 +216,12 @@ export default function App() {
   const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
 
-  const addLog = (msg) => {
-    const time = new Date().toLocaleTimeString('pt-BR');
-    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
-  };
-
   useEffect(() => {
     const checkBridge = async () => {
       try {
         const res = await fetch('http://127.0.0.1:19876/ping', { method: 'GET', mode: 'cors' });
         const data = await res.json();
-        if (data?.ok) {
-          setDesktopBridgeActive(true);
-        }
+        if (data?.ok) setDesktopBridgeActive(true);
       } catch (e) {}
     };
     checkBridge();
@@ -181,9 +264,7 @@ export default function App() {
     const clamped = Math.max(0, Math.min(100, Number(newVol)));
     setStreams(prev =>
       prev.map(s =>
-        s.id === streamId
-          ? { ...s, volume: clamped, muted: clamped === 0 }
-          : s
+        s.id === streamId ? { ...s, volume: clamped, muted: clamped === 0 } : s
       )
     );
   };
@@ -199,7 +280,6 @@ export default function App() {
     );
   };
 
-  // Alterna entre "Assistir" e "Parar de assistir" instantaneamente sem precisar de F5!
   const setWatchingStream = (streamId, shouldWatch) => {
     if (shouldWatch) {
       stoppedWatchingSetRef.current.delete(streamId);
@@ -217,7 +297,6 @@ export default function App() {
           ...s,
           watching: shouldWatch,
           minimized: false,
-          // Incrementa watchSession para remontar o VideoDecoder do zero quando clicar em Assistir
           watchSession: (s.watchSession || 0) + 1
         };
       })
@@ -225,9 +304,6 @@ export default function App() {
 
     if (shouldWatch) {
       socketRef.current?.emit('request-keyframe', { streamId });
-      addLog(`Assistindo transmissão [${streamId}]...`);
-    } else {
-      addLog(`Parou de assistir transmissão [${streamId}].`);
     }
   };
 
@@ -238,7 +314,6 @@ export default function App() {
       const { cleanRoom, cleanPass } = parseRoomInput(text, roomPassword);
       setRoomName(cleanRoom);
       if (cleanPass) setRoomPassword(cleanPass);
-      addLog(`Link colado: Sala "${cleanRoom}"`);
     } catch (e) {
       alert('Cole o link diretamente no campo "Nome da sala" (Ctrl+V).');
     }
@@ -259,7 +334,6 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      addLog(`Conectado ao VogelsTV na sala [${cleanRoom}]`);
       socket.emit('join-room', {
         roomName: cleanRoom,
         roomPassword: cleanPass,
@@ -310,7 +384,6 @@ export default function App() {
 
     socket.on('stream-started', (st) => {
       if (st.senderId === socket.id) return;
-      addLog(`${st.owner} iniciou transmissão (${st.res} @ ${st.fps} FPS)`);
       stoppedWatchingSetRef.current.delete(st.streamId);
 
       setStreams(prev => {
@@ -348,7 +421,6 @@ export default function App() {
     });
 
     socket.on('v-chunk', (meta, buffer) => {
-      // Se o stream ainda não estava registrado na lista local, registra respeitando se o usuário parou de assistir
       setStreams(prev => {
         if (prev.some(s => s.id === meta.id)) return prev;
         const isStopped = stoppedWatchingSetRef.current.has(meta.id);
@@ -384,6 +456,8 @@ export default function App() {
 
     socket.on('peer-stopped-stream', ({ streamId }) => {
       stoppedWatchingSetRef.current.delete(streamId);
+      clipManagersRef.current[streamId]?.destroy?.();
+      delete clipManagersRef.current[streamId];
       setStreams(prev => prev.filter(s => s.id !== streamId));
       delete videoChunkHandlersRef.current[streamId];
       delete audioChunkHandlersRef.current[streamId];
@@ -395,6 +469,7 @@ export default function App() {
 
     return () => {
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
+      Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
       socket.disconnect();
     };
   }, [inRoom, roomName, roomPassword, nickname]);
@@ -428,7 +503,7 @@ export default function App() {
           fps: fpsRef.current
         }, buf.buffer);
       },
-      error: (err) => addLog(`Aviso GPU Encoder: ${err.message}`)
+      error: () => {}
     });
 
     const configureEncoderNow = async (rawW, rawH) => {
@@ -446,7 +521,6 @@ export default function App() {
       if (videoEncoder.state !== 'closed') {
         videoEncoder.configure(bestCfg);
         forceKey = true;
-        addLog(`GPU Encoder ativo: ${targetW}x${targetH} @ ${targetFps} FPS (${currentCodecStr})`);
       }
     };
 
@@ -483,12 +557,6 @@ export default function App() {
             if (response.ok && response.body) {
               usingDesktopWasapi = true;
               setDiscordIsolatedActive(excludeDiscordRef.current);
-              addLog(
-                excludeDiscordRef.current
-                  ? 'Áudio WASAPI Ativo: Transmitindo som do PC/Jogo SEM a voz do Discord.'
-                  : 'Áudio WASAPI Ativo: Transmitindo todo o som do PC.'
-              );
-
               mediaStream.getAudioTracks().forEach(t => { t.enabled = false; t.stop(); });
 
               const reader = response.body.getReader();
@@ -654,9 +722,7 @@ export default function App() {
       });
 
       await startWebCodecsSender(newId, mediaStream, false);
-    } catch (err) {
-      addLog(`Compartilhamento cancelado: ${err.message}`);
-    }
+    } catch (err) {}
   };
 
   const handleShareCamera = async () => {
@@ -703,6 +769,8 @@ export default function App() {
   const stopStream = (streamId) => {
     activeEncodersRef.current[streamId]?.stop?.();
     delete activeEncodersRef.current[streamId];
+    clipManagersRef.current[streamId]?.destroy?.();
+    delete clipManagersRef.current[streamId];
 
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
@@ -714,40 +782,44 @@ export default function App() {
     if (expandedId === streamId) setExpandedId(null);
   };
 
-  // Faz o download direto do executável único VogelsTV.exe (sem .zip)
-  const triggerAppDownload = () => {
-    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-    const dlUrl = `/api/download-app?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
-    const a = document.createElement('a');
-    a.href = dlUrl;
-    a.download = 'VogelsTV.exe';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    addLog('Download do executável VogelsTV.exe iniciado.');
-  };
-
-  const saveClip30s = (streamId, owner, openReplay = false) => {
-    const chunks = clipChunksRef.current[streamId] || [];
-    if (!chunks.length) {
-      alert('Aguarde alguns segundos assistindo para acumular o buffer de 30s.');
+  // Item 4: Abre o Replay voltando 30 segundos do compartilhamento escolhido (ou baixa o clipe)
+  const handleReplayOrClip = async (targetStreamId, openModal = true) => {
+    const targetStream = streams.find(s => s.id === targetStreamId) || streams.find(s => s.watching !== false);
+    if (!targetStream) {
+      alert('Nenhuma transmissão ativa para gerar o replay de 30 segundos.');
       return;
     }
-    const mime = clipRecordersRef.current[streamId]?.mimeType || 'video/webm';
-    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
-    const blob = new Blob(chunks.map(c => c.blob), { type: mime });
-    const url = URL.createObjectURL(blob);
 
-    if (openReplay) {
-      setReplayClipUrl(url);
+    const manager = clipManagersRef.current[targetStream.id];
+    if (!manager) {
+      alert('Aguarde pelo menos 2 segundos assistindo à transmissão para capturar o replay.');
       return;
     }
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `VogelsTV_Clip_${owner}_${Date.now()}.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+
+    const res = await manager.captureLast30s();
+    if (!res || !res.url) {
+      alert('Acumulando frames da transmissão... tente novamente em 2 segundos!');
+      return;
+    }
+
+    if (openModal) {
+      if (replayModal?.url) URL.revokeObjectURL(replayModal.url);
+      setReplayModal({
+        streamId: targetStream.id,
+        owner: targetStream.owner,
+        url: res.url,
+        mimeType: res.mimeType,
+        durationSec: res.durationSec
+      });
+    } else {
+      const ext = res.mimeType.includes('mp4') ? 'mp4' : 'webm';
+      const a = document.createElement('a');
+      a.href = res.url;
+      a.download = `VogelsTV_Clip_${targetStream.owner}_${Date.now()}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
   };
 
   const sendChat = (e) => {
@@ -765,6 +837,9 @@ export default function App() {
     alert(`Link da sala copiado:\n${url}`);
   };
 
+  const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
+  const directExeUrl = `/api/download-app?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
+
   if (!inRoom) {
     return (
       <div className="h-screen w-screen bg-[#0D0F13] flex items-center justify-center p-4">
@@ -780,7 +855,6 @@ export default function App() {
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
               setRoomName(cleanRoom);
               if (cleanPass) setRoomPassword(cleanPass);
               if (nickname.trim() && cleanRoom) setInRoom(true);
@@ -844,7 +918,6 @@ export default function App() {
   const unwatchedStreams = streams.filter(s => !s.isLocal && s.watching === false);
   const minimizedStreams = streams.filter(s => s.watching !== false && s.minimized);
   const remoteStreams = streams.filter(s => !s.isLocal);
-  const { cleanRoom } = parseRoomInput(roomName, roomPassword);
 
   return (
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
@@ -975,6 +1048,16 @@ export default function App() {
             <span>📷</span> Câmera
           </button>
 
+          {watchingStreams.length > 0 && (
+            <button
+              onClick={() => handleReplayOrClip(watchingStreams[0].id, true)}
+              className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer"
+              title="Voltar 30 segundos do compartilhamento"
+            >
+              <span>⏪</span> Replay 30s
+            </button>
+          )}
+
           <button
             onClick={() => setGameMode(!gameMode)}
             className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer ${
@@ -1041,20 +1124,31 @@ export default function App() {
             )}
           </div>
 
-          <button onClick={() => setShowLogs(!showLogs)} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            📋 Logs
-          </button>
-
-          <button
-            onClick={triggerAppDownload}
-            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer"
-            title="Baixar executável VogelsTV.exe direto"
+          {/* Item 3: Link nativo direto para baixar o VogelsTV.exe */}
+          <a
+            href={directExeUrl}
+            download="VogelsTV.exe"
+            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer inline-flex items-center"
+            title="Baixar arquivo executável VogelsTV.exe"
           >
             Baixar app
-          </button>
+          </a>
 
           <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
             🔗 Link
+          </button>
+
+          {/* Item 7: Botão para minimizar / expandir o painel de Chat e Participantes */}
+          <button
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1 cursor-pointer transition ${
+              sidebarCollapsed
+                ? 'bg-red-600/25 border-red-500/60 text-red-200'
+                : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
+            }`}
+            title={sidebarCollapsed ? 'Expandir Chat e Participantes' : 'Minimizar Chat e Participantes (Modo Clean)'}
+          >
+            <span>💬</span> {sidebarCollapsed ? 'Abrir Chat' : 'Ocultar Chat'}
           </button>
 
           <button onClick={() => setInRoom(false)} className="bg-[#171B24] hover:bg-red-950/60 border border-red-800/60 text-xs text-red-300 rounded-md px-2.5 py-1.5 cursor-pointer">
@@ -1063,7 +1157,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative">
         <main className="flex-1 bg-[#0B0D11] relative flex flex-col p-3 overflow-hidden">
           {watchingStreams.length === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3">
@@ -1105,10 +1199,8 @@ export default function App() {
                     socketRef={socketRef}
                     videoChunkHandlersRef={videoChunkHandlersRef}
                     audioChunkHandlersRef={audioChunkHandlersRef}
-                    clipRecordersRef={clipRecordersRef}
-                    clipChunksRef={clipChunksRef}
+                    clipManagersRef={clipManagersRef}
                     clipConfig={clipConfig}
-                    clipDuration={clipDuration}
                     onStop={() => stopStream(streamObj.id)}
                     onStopWatching={() => setWatchingStream(streamObj.id, false)}
                     onMute={() => toggleStreamMute(streamObj.id)}
@@ -1116,8 +1208,8 @@ export default function App() {
                     onMinimize={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s))}
                     onExpand={() => setExpandedId(expandedId === streamObj.id ? null : streamObj.id)}
                     isExpanded={expandedId === streamObj.id}
-                    onClip={() => saveClip30s(streamObj.id, streamObj.owner, false)}
-                    onReplay={() => saveClip30s(streamObj.id, streamObj.owner, true)}
+                    onClip={() => handleReplayOrClip(streamObj.id, false)}
+                    onReplay={() => handleReplayOrClip(streamObj.id, true)}
                   />
                 ))}
             </div>
@@ -1139,124 +1231,155 @@ export default function App() {
           </div>
         </main>
 
-        <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0">
-          <div className="p-3 border-b border-[#1E232E]">
-            <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2">PARTICIPANTES</h3>
-            <div className="space-y-1.5">
-              {participants.map(p => {
-                const isMe = p.id === socketRef.current?.id;
-                const userStreams = streams.filter(
-                  s => (s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)
-                );
-                const hasActiveStream = userStreams.length > 0;
-                const isCurrentlyWatching = userStreams.some(s => s.watching !== false);
+        {/* Item 7: Painel Lateral Direito Retrátil (Participantes + Chat) */}
+        {!sidebarCollapsed && (
+          <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0 transition-all">
+            <div className="p-3 border-b border-[#1E232E]">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase">PARTICIPANTES</h3>
+                <button
+                  onClick={() => setSidebarCollapsed(true)}
+                  className="text-[10px] text-gray-400 hover:text-white bg-[#1B202B] px-1.5 py-0.5 rounded cursor-pointer"
+                  title="Minimizar painel lateral"
+                >
+                  ❯ Minimizar
+                </button>
+              </div>
+              <div className="space-y-1.5">
+                {participants.map(p => {
+                  const isMe = p.id === socketRef.current?.id;
+                  const userStreams = streams.filter(
+                    s => (s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)
+                  );
+                  const hasActiveStream = userStreams.length > 0;
+                  const isCurrentlyWatching = userStreams.some(s => s.watching !== false);
 
-                return (
-                  <div key={p.id} className="flex items-center justify-between text-xs gap-1">
-                    <div className="flex items-center gap-2 truncate">
-                      <span className={`w-2 h-2 rounded-full shrink-0 ${hasActiveStream ? 'bg-red-500 animate-pulse' : 'bg-emerald-400'}`}></span>
-                      <span className="text-gray-200 font-medium truncate">
-                        {p.nick} {isMe && <span className="text-gray-400">(você)</span>}
-                      </span>
-                    </div>
+                  return (
+                    <div key={p.id} className="flex items-center justify-between text-xs gap-1 min-h-[22px]">
+                      <div className="flex items-center gap-2 truncate">
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${hasActiveStream ? 'bg-red-500 animate-pulse' : 'bg-emerald-400'}`}></span>
+                        <span className="text-gray-200 font-medium truncate">
+                          {p.nick} {isMe && <span className="text-gray-400">(você)</span>}
+                        </span>
+                      </div>
 
-                    {/* No local onde ficava GPU Stream: botão Assistir / Parar de assistir */}
-                    {isMe ? (
-                      hasActiveStream ? (
+                      {/* Item 2: Só aparece botão Assistir / Parar de assistir se o usuário estiver compartilhando tela! */}
+                      {isMe && hasActiveStream && (
                         <button
                           onClick={() => userStreams.forEach(s => stopStream(s.id))}
                           className="text-[10px] bg-red-950/70 hover:bg-red-900 border border-red-700/60 text-red-200 px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
                         >
                           Parar live
                         </button>
-                      ) : (
-                        <span className="text-[10px] text-gray-500 bg-[#181C26] px-2 py-0.5 rounded shrink-0">
-                          Online
-                        </span>
-                      )
-                    ) : hasActiveStream ? (
-                      isCurrentlyWatching ? (
-                        <button
-                          onClick={() => userStreams.forEach(s => setWatchingStream(s.id, false))}
-                          className="text-[10px] bg-red-600/25 hover:bg-red-600/40 border border-red-500/50 text-red-300 font-medium px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
-                        >
-                          Parar de assistir
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => userStreams.forEach(s => setWatchingStream(s.id, true))}
-                          className="text-[10px] bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/60 text-emerald-300 font-semibold px-2.5 py-0.5 rounded cursor-pointer shrink-0 transition"
-                        >
-                          Assistir
-                        </button>
-                      )
-                    ) : (
-                      <button
-                        onClick={() => socketRef.current?.emit('request-active-streams')}
-                        className="text-[10px] text-gray-400 hover:text-white bg-[#181C26] hover:bg-[#222836] border border-[#262C3A] px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
-                        title="Verificar ou assistir transmissão deste participante"
-                      >
-                        Assistir
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+                      )}
 
-          <div className="flex-1 flex flex-col p-3 overflow-hidden">
-            <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2">CHAT</h3>
-            <div className="flex-1 bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 overflow-y-auto space-y-2 text-xs">
-              {messages.map(m =>
-                m.system ? (
-                  <p key={m.id} className="text-gray-400 italic text-[11px]">{m.text}</p>
-                ) : (
-                  <div key={m.id}>
-                    <span className="font-semibold text-red-400">{m.sender}: </span>
-                    <span className="text-gray-200 break-words">{m.text}</span>
-                  </div>
-                )
-              )}
+                      {!isMe && hasActiveStream && (
+                        isCurrentlyWatching ? (
+                          <button
+                            onClick={() => userStreams.forEach(s => setWatchingStream(s.id, false))}
+                            className="text-[10px] bg-red-600/25 hover:bg-red-600/40 border border-red-500/50 text-red-300 font-medium px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
+                          >
+                            Parar de assistir
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => userStreams.forEach(s => setWatchingStream(s.id, true))}
+                            className="text-[10px] bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/60 text-emerald-300 font-semibold px-2.5 py-0.5 rounded cursor-pointer shrink-0 transition"
+                          >
+                            Assistir
+                          </button>
+                        )
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-            <form onSubmit={sendChat} className="mt-2 flex gap-1.5">
-              <input
-                type="text"
-                value={chatInput}
-                onChange={e => setChatInput(e.target.value)}
-                placeholder="Mensagem..."
-                className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-red-500"
-              />
-              <button type="submit" className="bg-[#1C212E] hover:bg-[#252C3D] border border-[#2E364A] text-xs text-gray-200 px-3 py-1.5 rounded-md cursor-pointer">
-                Enviar
-              </button>
-            </form>
-          </div>
-        </aside>
+
+            <div className="flex-1 flex flex-col p-3 overflow-hidden">
+              <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2">CHAT</h3>
+              <div className="flex-1 bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 overflow-y-auto space-y-2 text-xs">
+                {messages.map(m =>
+                  m.system ? (
+                    <p key={m.id} className="text-gray-400 italic text-[11px]">{m.text}</p>
+                  ) : (
+                    <div key={m.id}>
+                      <span className="font-semibold text-red-400">{m.sender}: </span>
+                      <span className="text-gray-200 break-words">{m.text}</span>
+                    </div>
+                  )
+                )}
+              </div>
+              <form onSubmit={sendChat} className="mt-2 flex gap-1.5">
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  placeholder="Mensagem..."
+                  className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-red-500"
+                />
+                <button type="submit" className="bg-[#1C212E] hover:bg-[#252C3D] border border-[#2E364A] text-xs text-gray-200 px-3 py-1.5 rounded-md cursor-pointer">
+                  Enviar
+                </button>
+              </form>
+            </div>
+          </aside>
+        )}
       </div>
 
-      {showLogs && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
-          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-xl p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold flex items-center gap-1.5">Logs <VogelsLogo size="text-sm" /></h4>
-              <button onClick={() => setShowLogs(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
-            </div>
-            <div className="bg-[#0B0D11] border border-[#1E232E] rounded-lg p-3 h-64 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1">
-              {logs.map((l, i) => <div key={i}>{l}</div>)}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Item 4: Modal de Replay de 30 Segundos com escolha de compartilhamento */}
+      {replayModal && (
+        <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50">
+          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-3xl p-4 space-y-3 shadow-2xl">
+            <div className="flex items-center justify-between flex-wrap gap-2 border-b border-[#222834] pb-2.5">
+              <div className="flex items-center gap-2">
+                <h4 className="text-sm font-bold text-white">
+                  ⏪ Replay dos Últimos {replayModal.durationSec || 30}s — <span className="text-red-400">{replayModal.owner}</span>
+                </h4>
+              </div>
 
-      {replayClipUrl && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
-          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-2xl p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">⏪ Replay Instantâneo (Últimos 30s — Sem Áudio)</h4>
-              <button onClick={() => setReplayClipUrl(null)} className="text-xs text-gray-400 hover:text-white">✕</button>
+              {/* Seletor para trocar qual compartilhamento ver o Replay */}
+              <div className="flex items-center gap-2">
+                {watchingStreams.length > 1 && (
+                  <select
+                    value={replayModal.streamId}
+                    onChange={(e) => handleReplayOrClip(e.target.value, true)}
+                    className="bg-[#1B202B] border border-[#2C3446] text-xs text-white rounded px-2.5 py-1 cursor-pointer"
+                  >
+                    {watchingStreams.map(ws => (
+                      <option key={ws.id} value={ws.id}>
+                        Tela de: {ws.owner} ({ws.res})
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <a
+                  href={replayModal.url}
+                  download={`VogelsTV_Replay_${replayModal.owner}_${Date.now()}.${replayModal.mimeType?.includes('mp4') ? 'mp4' : 'webm'}`}
+                  className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1 rounded cursor-pointer"
+                >
+                  💾 Salvar Clipe
+                </a>
+                <button
+                  onClick={() => {
+                    if (replayModal?.url) URL.revokeObjectURL(replayModal.url);
+                    setReplayModal(null);
+                  }}
+                  className="text-xs text-gray-400 hover:text-white bg-[#1C212C] px-2.5 py-1 rounded cursor-pointer"
+                >
+                  ✕ Fechar
+                </button>
+              </div>
             </div>
-            <video src={replayClipUrl} controls autoPlay className="w-full rounded-lg bg-black max-h-[70vh]" />
+
+            <video
+              key={replayModal.url}
+              src={replayModal.url}
+              controls
+              autoPlay
+              loop
+              className="w-full rounded-lg bg-black max-h-[72vh]"
+            />
           </div>
         </div>
       )}
@@ -1270,10 +1393,8 @@ function VideoTile({
   socketRef,
   videoChunkHandlersRef,
   audioChunkHandlersRef,
-  clipRecordersRef,
-  clipChunksRef,
+  clipManagersRef,
   clipConfig,
-  clipDuration,
   onStop,
   onStopWatching,
   onMute,
@@ -1288,6 +1409,30 @@ function VideoTile({
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
+
+  // Item 5: Visibilidade dos controles estilo YouTube (aparece ao mover o mouse e some após 2.5 segundos)
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const hideTimerRef = useRef(null);
+
+  const handleMouseMoveTile = () => {
+    setControlsVisible(true);
+    if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = setTimeout(() => {
+      setControlsVisible(false);
+    }, 2500);
+  };
+
+  const handleMouseLeaveTile = () => {
+    if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    setControlsVisible(false);
+  };
+
+  useEffect(() => {
+    hideTimerRef.current = setTimeout(() => setControlsVisible(false), 3000);
+    return () => {
+      if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    };
+  }, []);
 
   const mutedRef = useRef(streamObj.muted);
   const volumeRef = useRef(streamObj.volume ?? 75);
@@ -1311,33 +1456,24 @@ function VideoTile({
     localVideoRef.current.srcObject = streamObj.stream;
     localVideoRef.current.play().catch(() => {});
 
-    const vTrack = streamObj.stream.getVideoTracks()[0];
-    if (vTrack && clipConfig !== 'off') {
-      try {
-        const videoOnly = new MediaStream([vTrack]);
-        const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1') ? 'video/mp4;codecs=avc1' : 'video/webm';
-        const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 4000000 });
-        clipChunksRef.current[streamObj.id] = [];
-        rec.ondataavailable = (e) => {
-          if (e.data?.size > 0) {
-            const list = clipChunksRef.current[streamObj.id] || [];
-            list.push({ blob: e.data, ts: Date.now() });
-            const cutoff = Date.now() - clipDuration * 1000;
-            clipChunksRef.current[streamObj.id] = list.length > 2 ? [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)] : list;
-          }
-        };
-        rec.start(1000);
-        clipRecordersRef.current[streamObj.id] = { recorder: rec, mimeType };
-      } catch (e) {}
+    if (clipConfig !== 'off') {
+      clipManagersRef.current[streamObj.id]?.destroy?.();
+      clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => streamObj.stream);
     }
-  }, [streamObj.isLocal, streamObj.stream]);
+
+    return () => {
+      clipManagersRef.current[streamObj.id]?.destroy?.();
+      delete clipManagersRef.current[streamObj.id];
+    };
+  }, [streamObj.isLocal, streamObj.stream, clipConfig]);
 
   useEffect(() => {
     if (streamObj.isLocal) return;
 
     const canvas = remoteCanvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    // Importante: sem desynchronized:true para que canvas.captureStream(30) capture 100% dos quadros no Replay de 30s!
+    const ctx = canvas.getContext('2d', { alpha: false });
 
     let decoder = null;
     let configuredCodec = null;
@@ -1493,28 +1629,18 @@ function VideoTile({
       } catch (e) {}
     }
 
+    // Inicia o Buffer Circular de 30s da transmissão remota
+    let sharedCanvasStream = null;
     if (clipConfig !== 'off' && canvas.captureStream) {
       setTimeout(() => {
         try {
-          const canvasStream = canvas.captureStream(30);
-          const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1') ? 'video/mp4;codecs=avc1' : 'video/webm';
-          const rec = new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond: 4000000 });
-          clipChunksRef.current[streamObj.id] = [];
-          rec.ondataavailable = (e) => {
-            if (e.data?.size > 0) {
-              const list = clipChunksRef.current[streamObj.id] || [];
-              list.push({ blob: e.data, ts: Date.now() });
-              const cutoff = Date.now() - clipDuration * 1000;
-              clipChunksRef.current[streamObj.id] = list.length > 2 ? [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)] : list;
-            }
-          };
-          rec.start(1000);
-          clipRecordersRef.current[streamObj.id] = { recorder: rec, mimeType };
+          sharedCanvasStream = canvas.captureStream(30);
+          clipManagersRef.current[streamObj.id]?.destroy?.();
+          clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => sharedCanvasStream);
         } catch (e) {}
-      }, 1500);
+      }, 800);
     }
 
-    // Pede keyframe imediatamente e repete a cada 400ms enquanto aguarda o 1º quadro (garante reabertura sem F5!)
     socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
     const keyframeRetryTimer = setInterval(() => {
       if (waitingForKey) {
@@ -1532,18 +1658,27 @@ function VideoTile({
     return () => {
       clearInterval(keyframeRetryTimer);
       clearInterval(statTimer);
+      clipManagersRef.current[streamObj.id]?.destroy?.();
+      delete clipManagersRef.current[streamObj.id];
       delete videoChunkHandlersRef.current[streamObj.id];
       delete audioChunkHandlersRef.current[streamObj.id];
       try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (e) {}
       try { if (audioDecoder && audioDecoder.state !== 'closed') audioDecoder.close(); } catch (e) {}
       try { if (audioCtx && audioCtx.state !== 'closed') audioCtx.close(); } catch (e) {}
     };
-  }, [streamObj.id, streamObj.isLocal]);
+  }, [streamObj.id, streamObj.isLocal, clipConfig]);
 
   const currentVol = streamObj.muted ? 0 : (streamObj.volume ?? 75);
 
   return (
-    <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
+    <div
+      onMouseMove={handleMouseMoveTile}
+      onMouseEnter={handleMouseMoveTile}
+      onMouseLeave={handleMouseLeaveTile}
+      className={`relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center ${
+        controlsVisible ? 'cursor-default' : 'cursor-none'
+      }`}
+    >
       {streamObj.isLocal ? (
         <video
           ref={localVideoRef}
@@ -1559,7 +1694,12 @@ function VideoTile({
         />
       )}
 
-      <div className="absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs">
+      {/* Barra Superior do Player (Some após 2.5s sem mexer o mouse, igual ao YouTube) */}
+      <div
+        className={`absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs transition-opacity duration-300 ${
+          controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        }`}
+      >
         <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
         <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
         <span className="text-emerald-300 font-mono text-[11px]">
@@ -1569,7 +1709,12 @@ function VideoTile({
         </span>
       </div>
 
-      <div className="absolute bottom-2.5 right-2.5 z-30 flex items-center gap-2 bg-black/85 px-2.5 py-1.5 rounded-lg border border-white/10">
+      {/* Barra Inferior de Controles (Some após 2.5s sem mexer o mouse, igual ao YouTube) */}
+      <div
+        className={`absolute bottom-2.5 right-2.5 z-30 flex items-center gap-2 bg-black/85 px-2.5 py-1.5 rounded-lg border border-white/10 transition-opacity duration-300 ${
+          controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        }`}
+      >
         {!streamObj.isLocal && (
           <div className="flex items-center gap-1.5 bg-[#1B202B] border border-[#2C3446] px-2 py-0.5 rounded">
             <button

@@ -2,9 +2,9 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
+import { EMBEDDED_EXE_B64 } from './exeData.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,41 +30,35 @@ function normalizeRoomKey(rawRoom, rawPassword) {
   return cleanPass ? `${cleanRoom}::pass:${cleanPass}` : cleanRoom;
 }
 
-// Entrega diretamente o arquivo executável único VogelsTV.exe já configurado para a sala atual
-app.get('/api/download-app', (req, res) => {
-  const rawProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-  const host = req.get('host') || 'telinha-platform.onrender.com';
-  const baseUrl = `${rawProto}://${host}`;
+// Rota direta para baixar o executável VogelsTV.exe (sem .zip)
+app.get(['/api/download-app', '/VogelsTV.exe'], (req, res) => {
+  try {
+    const rawProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = req.get('host') || 'telinha-platform.onrender.com';
+    const baseUrl = `${rawProto}://${host}`;
 
-  const salaParam = req.query.sala ? `&sala=${encodeURIComponent(String(req.query.sala))}` : '';
-  const senhaParam = req.query.senha ? `&senha=${encodeURIComponent(String(req.query.senha))}` : '';
-  const targetUrl = `${baseUrl}/?desktop=1${salaParam}${senhaParam}`;
+    const salaParam = req.query.sala ? `&sala=${encodeURIComponent(String(req.query.sala))}` : '';
+    const senhaParam = req.query.senha ? `&senha=${encodeURIComponent(String(req.query.senha))}` : '';
+    const targetUrl = `${baseUrl}/?desktop=1${salaParam}${senhaParam}`;
 
-  const exePaths = [
-    path.join(__dirname, 'dist', 'VogelsTV.exe'),
-    path.join(__dirname, 'public', 'VogelsTV.exe')
-  ];
-  const exePath = exePaths.find(p => fs.existsSync(p));
+    const exeBuffer = Buffer.from(EMBEDDED_EXE_B64, 'base64');
+    const placeholderStr = 'VOGELSTV_URL_SLOT_' + 'X'.repeat(140);
+    const searchBuf = Buffer.from(placeholderStr, 'utf16le');
+    const idx = exeBuffer.indexOf(searchBuf);
 
-  if (!exePath) {
-    return res.status(404).send('Executável não encontrado.');
+    if (idx !== -1 && targetUrl.length <= placeholderStr.length) {
+      const paddedUrl = targetUrl.padEnd(placeholderStr.length, ' ');
+      Buffer.from(paddedUrl, 'utf16le').copy(exeBuffer, idx);
+    }
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="VogelsTV.exe"');
+    res.setHeader('Content-Length', exeBuffer.length);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.end(exeBuffer);
+  } catch (err) {
+    return res.status(500).send('Erro ao baixar executável: ' + err.message);
   }
-
-  const exeBuffer = Buffer.from(fs.readFileSync(exePath));
-  const placeholderStr = 'VOGELSTV_TARGET_URL_PLACEHOLDER_' + 'X'.repeat(128);
-  const searchBuf = Buffer.from(placeholderStr, 'utf16le');
-  const idx = exeBuffer.indexOf(searchBuf);
-
-  if (idx !== -1 && targetUrl.length <= placeholderStr.length) {
-    const paddedUrl = targetUrl.padEnd(placeholderStr.length, ' ');
-    const replaceBuf = Buffer.from(paddedUrl, 'utf16le');
-    replaceBuf.copy(exeBuffer, idx);
-  }
-
-  res.setHeader('Content-Type', 'application/vnd.microsoft.portable-executable');
-  res.setHeader('Content-Disposition', 'attachment; filename="VogelsTV.exe"');
-  res.setHeader('Content-Length', exeBuffer.length);
-  res.send(exeBuffer);
 });
 
 const server = http.createServer(app);
@@ -109,13 +103,6 @@ io.on('connection', (socket) => {
     if (currentStreams.length > 0) {
       socket.to(cleanRoom).emit('force-keyframe');
     }
-  });
-
-  socket.on('request-active-streams', () => {
-    if (!currentRoom || !activeStreams.has(currentRoom)) return;
-    const currentStreams = Array.from(activeStreams.get(currentRoom).values());
-    socket.emit('active-streams', currentStreams);
-    socket.to(currentRoom).emit('force-keyframe');
   });
 
   socket.on('start-stream', (meta) => {
@@ -199,5 +186,5 @@ app.get('*', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[VogelsTV] Rodando na porta ${PORT}`);
+  console.log(`[VogelsTV] Servidor rodando na porta ${PORT}`);
 });
