@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
-const ICE_SERVERS = [
+const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
@@ -17,14 +17,22 @@ const ICE_SERVERS = [
   }
 ];
 
+const RES_MAP = {
+  '720p': { width: 1280, height: 720, bitrate: 6000000, label: '720p' },
+  '1080p': { width: 1920, height: 1080, bitrate: 10000000, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, bitrate: 15000000, label: '2K (1440p)' },
+  'auto': { width: 1920, height: 1080, bitrate: 10000000, label: '1080p' }
+};
+
 export default function App() {
   const [inRoom, setInRoom] = useState(false);
   const [nickname, setNickname] = useState(() => localStorage.getItem('tl_nick') || 'gosadinhas');
   const [roomName, setRoomName] = useState('squad-brasil');
 
-  const [quality, setQuality] = useState('auto');
+  // Controles de Qualidade (Padrão 1080p / 60fps)
+  const [quality, setQuality] = useState('1080p');
   const [sharpness, setSharpness] = useState('detail');
-  const [fps, setFps] = useState(30);
+  const [fps, setFps] = useState(60);
   const [gameMode, setGameMode] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
@@ -33,7 +41,7 @@ export default function App() {
 
   const [smoothness, setSmoothness] = useState('smooth');
   const [codec, setCodec] = useState('AUTO');
-  const [clipConfig, setClipConfig] = useState('720p');
+  const [clipConfig, setClipConfig] = useState('1080p');
   const [clipDuration, setClipDuration] = useState(30);
   const [connPolicy, setConnPolicy] = useState('auto');
 
@@ -49,11 +57,12 @@ export default function App() {
 
   const socketRef = useRef(null);
   const pcsRef = useRef({});
+  const webrtcConnectedRef = useRef({}); // streamId -> true quando WebRTC está ativo (desliga o Plano B lento)
   const pendingCandidatesRef = useRef({});
   const participantsRef = useRef([]);
   const localStreamsRef = useRef([]);
   const relayIntervalsRef = useRef({});
-  const relayFramesRef = useRef({}); // streamId -> última imagem base64 de fallback
+  const relayFramesRef = useRef({});
   const clipChunksRef = useRef({});
   const recordersRef = useRef({});
 
@@ -71,6 +80,55 @@ export default function App() {
     localStorage.setItem('tl_nick', nickname);
   }, [nickname]);
 
+  // Atualiza resolução, FPS e Bitrate EM TEMPO REAL se o usuário mudar os seletores durante a live!
+  useEffect(() => {
+    const targetCfg = RES_MAP[quality] || RES_MAP['1080p'];
+    const targetFps = gameMode ? 60 : Number(fps);
+
+    localStreamsRef.current.forEach(async (ls) => {
+      if (ls.type === 'Câmera') return;
+      const vTrack = ls.stream.getVideoTracks()[0];
+      if (!vTrack) return;
+
+      try {
+        await vTrack.applyConstraints({
+          width: { ideal: targetCfg.width },
+          height: { ideal: targetCfg.height },
+          frameRate: { ideal: targetFps, max: 60 }
+        });
+        if ('contentHint' in vTrack) {
+          vTrack.contentHint = gameMode ? 'motion' : sharpness;
+        }
+      } catch (e) {}
+
+      ls.res = targetCfg.label;
+      ls.fps = targetFps;
+
+      // Atualiza todos os RTCPeerConnections enviando para os amigos para subir o bitrate para até 15 Mbps
+      Object.entries(pcsRef.current).forEach(([key, pc]) => {
+        if (key.endsWith(ls.id)) {
+          pc.getSenders().forEach(sender => {
+            if (sender.track && sender.track.kind === 'video') {
+              try {
+                const params = sender.getParameters();
+                if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+                params.encodings[0].maxBitrate = targetCfg.bitrate;
+                params.encodings[0].maxFramerate = targetFps;
+                params.encodings[0].scaleResolutionDownBy = 1.0;
+                params.degradationPreference = 'maintain-resolution';
+                sender.setParameters(params).catch(() => {});
+              } catch (e) {}
+            }
+          });
+        }
+      });
+
+      setStreams(prev => prev.map(s => s.id === ls.id ? { ...s, res: targetCfg.label, fps: targetFps } : s));
+      socketRef.current?.emit('stream-meta-update', { streamId: ls.id, res: targetCfg.label, fps: targetFps });
+      addLog(`Qualidade atualizada ao vivo: ${targetCfg.label} @ ${targetFps} FPS (${targetCfg.bitrate / 1000000} Mbps)`);
+    });
+  }, [quality, fps, sharpness, gameMode]);
+
   useEffect(() => {
     if (!inRoom) return;
 
@@ -80,7 +138,7 @@ export default function App() {
     socket.on('connect', () => {
       addLog(`Conectado ao servidor (ID: ${socket.id})`);
       socket.emit('join-room', { roomName, nickname });
-      setTimeout(() => socket.emit('request-streams'), 800);
+      setTimeout(() => socket.emit('request-streams'), 600);
     });
 
     socket.on('room-users', (usersList) => {
@@ -90,10 +148,14 @@ export default function App() {
 
     socket.on('user-joined', ({ id, nick }) => {
       if (id === socket.id) return;
-      addLog(`Sincronizando transmissões com ${nick || id}...`);
+      addLog(`Sincronizando transmissões de alta qualidade com ${nick || id}...`);
       localStreamsRef.current.forEach(ls => {
         createOfferForPeer(id, ls);
       });
+    });
+
+    socket.on('stream-meta-update', ({ streamId, res, fps: newFps }) => {
+      setStreams(prev => prev.map(s => s.id === streamId ? { ...s, res, fps: newFps } : s));
     });
 
     socket.on('webrtc-signal', async ({ senderId, signal, streamMeta }) => {
@@ -102,8 +164,8 @@ export default function App() {
 
       try {
         if (signal.type === 'offer') {
-          addLog(`Recebendo transmissão WebRTC de ${streamMeta.owner}...`);
-          const pc = createPeerConnection(senderId, streamMeta, false);
+          addLog(`Recebendo oferta WebRTC HD/2K de ${streamMeta.owner}...`);
+          const pc = createPeerConnection(senderId, streamMeta);
           pcsRef.current[key] = pc;
 
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
@@ -115,6 +177,10 @@ export default function App() {
           pendingCandidatesRef.current[key] = [];
 
           const answer = await pc.createAnswer();
+          // Eleva o limite de bitrate no SDP para garantir 12-15 Mbps sem compressão agressiva do Chrome
+          if (answer.sdp) {
+            answer.sdp = answer.sdp.replace(/(m=video.*\r\n)/g, `$1b=AS:15000\r\n`);
+          }
           await pc.setLocalDescription(answer);
 
           socket.emit('webrtc-signal', {
@@ -131,7 +197,7 @@ export default function App() {
               await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
             }
             pendingCandidatesRef.current[key] = [];
-            addLog(`Conexão de vídeo estabelecida com ${ senderId.slice(0,5) }!`);
+            addLog(`Conexão WebRTC P2P/TURN de alta taxa ativa!`);
           }
         } else if (signal.candidate) {
           const pc = pcsRef.current[key];
@@ -147,8 +213,9 @@ export default function App() {
       }
     });
 
-    // Recebe quadros do Plano B Automático (Garante imagem visível mesmo se o UDP/CGNAT bloquear WebRTC)
+    // O Plano B via WebSocket agora só roda em 720p HD se o WebRTC ainda não tiver conectado
     socket.on('relay-frame', ({ senderId, streamId, owner, res, fps: rFps, frame }) => {
+      if (webrtcConnectedRef.current[streamId]) return; // Ignora Plano B se o WebRTC 60fps já conectou!
       relayFramesRef.current[streamId] = frame;
       setStreams(prev => {
         const exists = prev.find(s => s.id === streamId);
@@ -161,12 +228,12 @@ export default function App() {
             id: streamId,
             peerId: senderId,
             owner: owner || 'Amigo',
-            type: 'Tela (Plano B)',
+            type: 'Tela',
             stream: null,
             lastRelayFrame: frame,
             muted: true,
             minimized: false,
-            fps: rFps || 30,
+            fps: rFps || 60,
             res: res || '1080p',
             isLocal: false
           }
@@ -181,6 +248,7 @@ export default function App() {
         delete pcsRef.current[key];
       }
       delete relayFramesRef.current[streamId];
+      delete webrtcConnectedRef.current[streamId];
       setStreams(prev => prev.filter(s => s.id !== streamId));
     });
 
@@ -213,9 +281,10 @@ export default function App() {
     }
 
     const pc = new RTCPeerConnection({
-      iceServers: ICE_SERVERS,
+      iceServers: DEFAULT_ICE_SERVERS,
       iceTransportPolicy: connPolicy === 'turn' ? 'relay' : 'all',
-      bundlePolicy: 'max-bundle'
+      bundlePolicy: 'max-bundle',
+      iceCandidatePoolSize: 10
     });
 
     pc.onicecandidate = (event) => {
@@ -237,7 +306,7 @@ export default function App() {
       setStreams(prev => {
         const exists = prev.find(s => s.id === streamMeta.streamId);
         if (exists) {
-          return prev.map(s => s.id === streamMeta.streamId ? { ...s, stream: activeStream } : s);
+          return prev.map(s => s.id === streamMeta.streamId ? { ...s, stream: activeStream, res: streamMeta.res, fps: streamMeta.fps } : s);
         }
         const newObj = {
           id: streamMeta.streamId,
@@ -258,7 +327,11 @@ export default function App() {
     };
 
     pc.oniceconnectionstatechange = () => {
-      addLog(`ICE [${streamMeta.owner}]: ${pc.iceConnectionState}`);
+      const state = pc.iceConnectionState;
+      addLog(`ICE [${streamMeta.owner}]: ${state}`);
+      if (state === 'connected' || state === 'completed') {
+        webrtcConnectedRef.current[streamMeta.streamId] = true;
+      }
     };
 
     return pc;
@@ -266,6 +339,7 @@ export default function App() {
 
   const createOfferForPeer = async (targetPeerId, localStreamObj) => {
     try {
+      const targetCfg = RES_MAP[quality] || RES_MAP['1080p'];
       const streamMeta = {
         streamId: localStreamObj.id,
         owner: nickname,
@@ -278,13 +352,27 @@ export default function App() {
       pcsRef.current[key] = pc;
 
       localStreamObj.stream.getTracks().forEach(track => {
-        pc.addTrack(track, localStreamObj.stream);
+        const sender = pc.addTrack(track, localStreamObj.stream);
+        if (track.kind === 'video') {
+          try {
+            const params = sender.getParameters();
+            if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+            params.encodings[0].maxBitrate = targetCfg.bitrate;
+            params.encodings[0].maxFramerate = Number(localStreamObj.fps);
+            params.encodings[0].scaleResolutionDownBy = 1.0;
+            params.degradationPreference = 'maintain-resolution';
+            sender.setParameters(params).catch(() => {});
+          } catch (e) {}
+        }
       });
 
       const offer = await pc.createOffer({
         offerToReceiveVideo: true,
         offerToReceiveAudio: true
       });
+      if (offer.sdp) {
+        offer.sdp = offer.sdp.replace(/(m=video.*\r\n)/g, `$1b=AS:15000\r\n`);
+      }
       await pc.setLocalDescription(offer);
 
       socketRef.current?.emit('webrtc-signal', {
@@ -297,7 +385,7 @@ export default function App() {
     }
   };
 
-  // Inicia também o transmissor de segurança Plano B (Canvas -> WebSocket) para furar qualquer CGNAT imediatamente
+  // O Plano B via WebSocket agora transmite em 720p HD (1280x720) e para de gastar CPU assim que o WebRTC 60fps conecta!
   const startBackupRelaySender = (streamObj) => {
     const hiddenVideo = document.createElement('video');
     hiddenVideo.srcObject = streamObj.stream;
@@ -310,12 +398,17 @@ export default function App() {
 
     const interval = setInterval(() => {
       if (!hiddenVideo.videoWidth) return;
-      const targetW = 854;
-      const targetH = Math.round((hiddenVideo.videoHeight / hiddenVideo.videoWidth) * targetW) || 480;
+      // Verifica se todos os peers já estão com WebRTC conectado; se sim, não envia frames de fallback desnecessários
+      const allConnected = Object.values(pcsRef.current).length > 0 &&
+        Object.values(pcsRef.current).every(pc => pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed');
+      if (allConnected) return;
+
+      const targetW = 1280;
+      const targetH = Math.round((hiddenVideo.videoHeight / hiddenVideo.videoWidth) * targetW) || 720;
       canvas.width = targetW;
       canvas.height = targetH;
       ctx.drawImage(hiddenVideo, 0, 0, targetW, targetH);
-      const base64Frame = canvas.toDataURL('image/jpeg', 0.62);
+      const base64Frame = canvas.toDataURL('image/jpeg', 0.80);
 
       socketRef.current?.emit('relay-frame', {
         streamId: streamObj.id,
@@ -324,7 +417,7 @@ export default function App() {
         fps: streamObj.fps,
         frame: base64Frame
       });
-    }, 180); // Garante imagem ao vivo contínua mesmo se o UDP do WebRTC estiver bloqueado
+    }, 90);
 
     relayIntervalsRef.current[streamObj.id] = interval;
   };
@@ -343,7 +436,7 @@ export default function App() {
 
         const recorder = new MediaRecorder(videoOnlyStream, {
           mimeType,
-          videoBitsPerSecond: 3500000
+          videoBitsPerSecond: 6000000
         });
 
         clipChunksRef.current[streamId] = [];
@@ -391,19 +484,13 @@ export default function App() {
 
   const handleShareScreen = async () => {
     try {
-      const resMap = {
-        '720p': { width: 1280, height: 720 },
-        '1080p': { width: 1920, height: 1080 },
-        '1440p': { width: 2560, height: 1440 },
-        'auto': { width: 1920, height: 1080 }
-      };
-      const targetRes = resMap[quality] || resMap['auto'];
+      const targetCfg = RES_MAP[quality] || RES_MAP['1080p'];
       const targetFps = gameMode ? 60 : Number(fps);
 
       const mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          width: { ideal: targetRes.width },
-          height: { ideal: targetRes.height },
+          width: { ideal: targetCfg.width, max: 2560 },
+          height: { ideal: targetCfg.height, max: 1440 },
           frameRate: { ideal: targetFps, max: 60 }
         },
         audio: true
@@ -426,7 +513,7 @@ export default function App() {
         muted: true,
         minimized: false,
         fps: targetFps,
-        res: quality === 'auto' ? '1080p' : quality,
+        res: targetCfg.label,
         isLocal: true
       };
 
@@ -441,7 +528,7 @@ export default function App() {
         }
       });
 
-      addLog(`Compartilhamento iniciado (${newStreamObj.res} @ ${targetFps}fps)`);
+      addLog(`Transmissão iniciada em ${targetCfg.label} @ ${targetFps} FPS`);
     } catch (err) {
       addLog(`Compartilhamento cancelado: ${err.message}`);
     }
@@ -450,7 +537,7 @@ export default function App() {
   const handleShareCamera = async () => {
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: Number(fps) } },
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: Number(fps) } },
         audio: false
       });
       const newId = 'cam_' + Math.random().toString(36).substring(2, 9);
@@ -466,7 +553,7 @@ export default function App() {
         muted: true,
         minimized: false,
         fps: Number(fps),
-        res: '720p',
+        res: '1080p',
         isLocal: true
       };
 
@@ -505,7 +592,7 @@ export default function App() {
   const runIpv6Diagnostic = async () => {
     setShowIpv6Modal(true);
     setIpv6Diag({ running: true, hasIpv6: false, candidates: [] });
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS });
     pc.createDataChannel('ipv6_test');
     const list = [];
     let v6 = false;
@@ -598,9 +685,8 @@ export default function App() {
 
         <div className="flex items-center gap-1.5 flex-wrap">
           <select value={quality} onChange={e => setQuality(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            <option value="auto">Qualidade: automática</option>
             <option value="720p">Qualidade: 720p</option>
-            <option value="1080p">Qualidade: 1080p</option>
+            <option value="1080p">Qualidade: 1080p (Full HD)</option>
             <option value="1440p">Qualidade: 2K (1440p)</option>
           </select>
 
@@ -616,10 +702,6 @@ export default function App() {
 
           <button onClick={handleShareCamera} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer">
             <span>📷</span> Câmera
-          </button>
-
-          <button onClick={() => socketRef.current?.emit('send-cheer')} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer">
-            <span>🎉</span> Diga que valeu
           </button>
 
           <button
@@ -658,9 +740,9 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Codec de vídeo</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="AUTO">Automático (H.264 / VP8)</option>
-                    <option value="H264">H.264 (NVENC)</option>
-                    <option value="VP9">VP9</option>
+                    <option value="AUTO">Automático (H.264 / VP9)</option>
+                    <option value="H264">H.264 (NVENC / Hardware)</option>
+                    <option value="VP9">VP9 (Alta Nitidez)</option>
                     <option value="AV1">AV1</option>
                   </select>
                 </div>
@@ -668,8 +750,8 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Clipes e replay</label>
                   <select value={clipConfig} onChange={e => setClipConfig(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="720p">Ligado · 720p (leve)</option>
                     <option value="1080p">Ligado · 1080p</option>
+                    <option value="720p">Ligado · 720p (leve)</option>
                     <option value="off">Desligado</option>
                   </select>
                 </div>
@@ -749,7 +831,6 @@ export default function App() {
                     <span className="text-gray-200 font-medium">
                       {p.nick} {p.id === socketRef.current?.id && <span className="text-gray-400">(você)</span>}
                     </span>
-                    <span className="text-amber-400 text-[11px]">✨ {p.cheers || 0}</span>
                   </div>
                   <span className="text-[10px] text-emerald-400/80 bg-emerald-950/40 px-1.5 py-0.5 rounded">{p.conn}</span>
                 </div>
@@ -791,7 +872,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">Logs WebRTC / Plano B</h4>
+              <h4 className="text-sm font-semibold">Logs WebRTC / Qualidade</h4>
               <button onClick={() => setShowLogs(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="bg-[#0B0D11] border border-[#1E232E] rounded-lg p-3 h-64 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1">
@@ -809,7 +890,7 @@ export default function App() {
               <button onClick={() => setShowIpv6Modal(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="text-xs space-y-2 bg-[#0D1016] p-3 rounded-lg border border-[#1E232E]">
-              <div>IPv6 Direto: {ipv6Diag.hasIpv6 ? <span className="text-emerald-400 font-semibold">Detectado</span> : <span className="text-amber-400">Usando IPv4 + Plano B Híbrido</span>}</div>
+              <div>IPv6 Direto: {ipv6Diag.hasIpv6 ? <span className="text-emerald-400 font-semibold">Detectado</span> : <span className="text-amber-400">Usando IPv4 + TURN</span>}</div>
               <div className="text-[11px] text-gray-400 font-mono max-h-40 overflow-y-auto pt-2 border-t border-[#1E232E]">
                 {ipv6Diag.candidates.map((c, i) => <div key={i} className="truncate">{c}</div>)}
               </div>
@@ -836,13 +917,14 @@ export default function App() {
 function VideoTile({ streamObj, onStop, onMute, onMinimize, onExpand, isExpanded, onClip, onReplay }) {
   const videoRef = useRef(null);
   const [webrtcPlaying, setWebrtcPlaying] = useState(false);
+  const [realRes, setRealRes] = useState('');
 
   useEffect(() => {
     const el = videoRef.current;
     if (!el || !streamObj.stream) return;
 
     el.srcObject = streamObj.stream;
-    el.muted = true; // Garante início sem bloqueio do navegador
+    el.muted = true;
     el.play().then(() => {
       if (!streamObj.isLocal) el.muted = streamObj.muted;
     }).catch(() => {});
@@ -850,8 +932,9 @@ function VideoTile({ streamObj, onStop, onMute, onMinimize, onExpand, isExpanded
     const checkVideoFrames = setInterval(() => {
       if (el.videoWidth > 0 && el.readyState >= 2) {
         setWebrtcPlaying(true);
+        setRealRes(`${el.videoHeight}p`);
       }
-    }, 500);
+    }, 400);
 
     return () => clearInterval(checkVideoFrames);
   }, [streamObj.stream]);
@@ -864,33 +947,32 @@ function VideoTile({ streamObj, onStop, onMute, onMinimize, onExpand, isExpanded
 
   return (
     <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
-      {/* Vídeo WebRTC P2P Direto */}
+      {/* IMPORTANTE: nunca usar display:none no <video> WebRTC para o Chrome não pausar o decodificador de hardware! */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted={streamObj.isLocal ? true : streamObj.muted}
-        className={`w-full h-full object-contain bg-black ${(!streamObj.isLocal && !webrtcPlaying && streamObj.lastRelayFrame) ? 'hidden' : 'block'}`}
+        className="w-full h-full object-contain bg-black z-10"
       />
 
-      {/* Plano B Automático (Mostra a imagem via WebSocket imediatamente se o CGNAT bloquear o WebRTC UDP) */}
       {!streamObj.isLocal && !webrtcPlaying && streamObj.lastRelayFrame && (
         <img
           src={streamObj.lastRelayFrame}
           alt={streamObj.owner}
-          className="w-full h-full object-contain bg-black"
+          className="absolute inset-0 w-full h-full object-contain bg-black z-20"
         />
       )}
 
-      <div className="absolute top-2.5 left-2.5 flex items-center gap-2 bg-black/75 px-2.5 py-1 rounded-md border border-white/10 text-xs">
+      <div className="absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/75 px-2.5 py-1 rounded-md border border-white/10 text-xs">
         <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
         <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
         <span className="text-gray-400 text-[11px]">
-          · {streamObj.res} · {streamObj.fps} FPS {!streamObj.isLocal && (!webrtcPlaying && streamObj.lastRelayFrame ? '· Plano B Ativo' : '· Direto')}
+          · {realRes || streamObj.res} · {streamObj.fps} FPS
         </span>
       </div>
 
-      <div className="absolute bottom-2.5 right-2.5 flex items-center gap-1.5 bg-black/80 p-1.5 rounded-lg border border-white/10">
+      <div className="absolute bottom-2.5 right-2.5 z-30 flex items-center gap-1.5 bg-black/80 p-1.5 rounded-lg border border-white/10">
         <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">🎬 Clipe 30s</button>
         <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
         <button onClick={onMute} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">

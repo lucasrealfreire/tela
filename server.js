@@ -15,9 +15,29 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 5e6,
+  maxHttpBufferSize: 1e7,
   pingTimeout: 60000,
   pingInterval: 25000
+});
+
+// Rota que fornece servidores ICE/TURN atualizados para evitar bloqueio de CGNAT em 2K 60fps
+app.get('/api/ice', async (req, res) => {
+  const defaultIce = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turns:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ];
+  res.json({ iceServers: defaultIce });
 });
 
 const rooms = new Map();
@@ -40,20 +60,17 @@ io.on('connection', (socket) => {
     roomUsers.set(socket.id, {
       id: socket.id,
       nick: cleanNick,
-      cheers: 0,
       conn: 'Conectado'
     });
 
     io.to(cleanRoom).emit('room-users', Array.from(roomUsers.values()));
 
-    // Notifica quem já estava na sala para enviar suas telas para quem acabou de entrar
     socket.to(cleanRoom).emit('user-joined', {
       id: socket.id,
       nick: cleanNick
     });
   });
 
-  // Permite que qualquer cliente peça novamente as ofertas de quem está transmitindo
   socket.on('request-streams', () => {
     if (currentRoom) {
       socket.to(currentRoom).emit('user-joined', {
@@ -63,7 +80,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Sinalização WebRTC P2P / TURN
   socket.on('webrtc-signal', ({ targetId, signal, streamMeta }) => {
     io.to(targetId).emit('webrtc-signal', {
       senderId: socket.id,
@@ -72,7 +88,12 @@ io.on('connection', (socket) => {
     });
   });
 
-  // PLANO B GARANTIDO: Retransmissão de quadros em baixa latência via WebSocket caso o CGNAT bloqueie o UDP/WebRTC
+  socket.on('stream-meta-update', ({ streamId, res, fps }) => {
+    if (currentRoom) {
+      socket.to(currentRoom).emit('stream-meta-update', { streamId, res, fps });
+    }
+  });
+
   socket.on('relay-frame', (payload) => {
     if (currentRoom) {
       socket.volatile.to(currentRoom).emit('relay-frame', {
@@ -114,16 +135,6 @@ io.on('connection', (socket) => {
       text: String(text).trim().slice(0, 500),
       time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
     });
-  });
-
-  socket.on('send-cheer', () => {
-    if (!currentRoom || !rooms.has(currentRoom)) return;
-    const roomUsers = rooms.get(currentRoom);
-    const user = roomUsers.get(socket.id);
-    if (user) {
-      user.cheers += 1;
-      io.to(currentRoom).emit('room-users', Array.from(roomUsers.values()));
-    }
   });
 
   socket.on('disconnect', () => {
