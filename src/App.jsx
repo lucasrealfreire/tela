@@ -32,7 +32,7 @@ function parseRoomInput(rawRoom, rawPass) {
       if (u.searchParams.get('senha') && !p) p = u.searchParams.get('senha');
     } catch (e) {}
   }
-  const cleanRoom = r.toLowerCase().replace(/\s+/g, '-').slice(0, 40) || 'squad-brasil';
+  const cleanRoom = r.toLowerCase().replace(/\s+/g, '-').slice(0, 40);
   const cleanPass = p.toLowerCase().slice(0, 30);
   return {
     cleanRoom,
@@ -60,7 +60,6 @@ function unpackBinaryFrame(arrayBuffer) {
   return { headerObj, payloadBuffer };
 }
 
-// Configura High Profile com VBR (Variable Bitrate) para manter imagem limpa sem estourar o limite de tráfego da Cloudflare!
 async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
   const w = Math.max(2, Math.floor(width / 2) * 2);
   const h = Math.max(2, Math.floor(height / 2) * 2);
@@ -138,12 +137,23 @@ function createZeroCpuChunkBuffer() {
 
 export default function App() {
   const [inRoom, setInRoom] = useState(false);
-  const [nickname, setNickname] = useState(() => localStorage.getItem('tv_nick') || 'gosadinhas');
-  const [roomName, setRoomName] = useState('squad-brasil');
+
+  // Item 3: Sem valores padrão fixos ("gosadinhas" e "squad-brasil" removidos); iniciam vazios com os placeholders solicitados
+  const [nickname, setNickname] = useState('');
+  const [roomName, setRoomName] = useState('');
   const [roomPassword, setRoomPassword] = useState('');
 
+  // Item 4: Histórico de até 3 últimas salas salvas no navegador
+  const [recentRooms, setRecentRooms] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('tv_recent_rooms') || '[]');
+      return Array.isArray(saved) ? saved.slice(0, 3) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
   const [quality, setQuality] = useState('1080p');
-  // 4000 kbps VBR High Profile por padrão: imagem limpa a 60fps sem derrubar a instância da Cloudflare!
   const [bitrateKbps, setBitrateKbps] = useState(4000);
   const [fps, setFps] = useState(60);
   const [gameMode, setGameMode] = useState(true);
@@ -166,26 +176,26 @@ export default function App() {
     const saved = localStorage.getItem('tv_exclude_discord');
     return saved !== null ? saved === 'true' : true;
   });
-  const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
-  const [discordIsolatedActive, setDiscordIsolatedActive] = useState(false);
 
   const [codec, setCodec] = useState('H264');
 
-  // ID único persistente desta aba (garante que reconexões automáticas nunca dupliquem nem derrubem o usuário!)
   const persistentClientIdRef = useRef('u_' + Math.random().toString(36).substring(2, 10));
   const [myId, setMyId] = useState(persistentClientIdRef.current);
   const myIdRef = useRef(persistentClientIdRef.current);
   const localStreamIdsRef = useRef(new Set());
-  const activeLocalMetasRef = useRef(new Map()); // streamId -> meta (para reanunciar automaticamente após reconexão!)
+  const activeLocalMetasRef = useRef(new Map());
 
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [messages, setMessages] = useState([
-    { id: 'sys-1', system: true, text: 'Sessão iniciada com proteção Anti-Queda ativa. Mande o link para a galera!' }
+    { id: 'sys-1', system: true, text: 'Sessão iniciada. Mande o link da sala para a galera!' }
   ]);
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef(null);
+
+  // Detecta se o dispositivo suporta compartilhamento de tela (PC vs Celular)
+  const canShareScreen = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getDisplayMedia);
 
   const transportRef = useRef({
     mode: 'none',
@@ -205,7 +215,6 @@ export default function App() {
   const bitrateKbpsRef = useRef(bitrateKbps);
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
-  const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
 
   useEffect(() => {
@@ -213,20 +222,6 @@ export default function App() {
   }, [messages]);
 
   useEffect(() => {
-    const checkBridge = async () => {
-      try {
-        const res = await fetch('http://127.0.0.1:19876/ping', { method: 'GET', mode: 'cors' });
-        const data = await res.json();
-        if (data?.ok) setDesktopBridgeActive(true);
-      } catch (e) {}
-    };
-    checkBridge();
-    const timer = setInterval(checkBridge, 4000);
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    excludeDiscordRef.current = excludeDiscordAudio;
     localStorage.setItem('tv_exclude_discord', String(excludeDiscordAudio));
   }, [excludeDiscordAudio]);
 
@@ -253,9 +248,32 @@ export default function App() {
     if (params.get('senha')) setRoomPassword(params.get('senha'));
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem('tv_nick', nickname);
-  }, [nickname]);
+  // Salva a sala nas últimas 3 salas visitadas
+  const saveRoomToHistory = (cRoom, cPass, usedNick) => {
+    try {
+      const entry = {
+        room: cRoom,
+        pass: cPass || '',
+        nick: usedNick,
+        ts: Date.now()
+      };
+      const filtered = recentRooms.filter(item => item.room !== cRoom);
+      const updated = [entry, ...filtered].slice(0, 3);
+      setRecentRooms(updated);
+      localStorage.setItem('tv_recent_rooms', JSON.stringify(updated));
+      localStorage.setItem('tv_last_nick', usedNick);
+    } catch (e) {}
+  };
+
+  // Item 4: Ao clicar em uma das últimas 3 salas, entra automaticamente!
+  const handleQuickJoinRecentRoom = (item) => {
+    const chosenNick = nickname.trim() || item.nick || localStorage.getItem('tv_last_nick') || 'Visitante';
+    setNickname(chosenNick);
+    setRoomName(item.room);
+    setRoomPassword(item.pass || '');
+    saveRoomToHistory(item.room, item.pass || '', chosenNick);
+    setInRoom(true);
+  };
 
   useEffect(() => {
     if (!inRoom) return;
@@ -453,7 +471,6 @@ export default function App() {
             nickname
           }));
 
-          // Se já estávamos transmitindo antes da reconexão, reanuncia nossa live automaticamente sem interromper!
           activeLocalMetasRef.current.forEach((meta) => {
             controlWs.send(JSON.stringify({ type: 'start-stream', meta }));
           });
@@ -488,7 +505,6 @@ export default function App() {
           if (!cfEverConnected && !fallbackSocket) {
             startSocketIoFallback();
           } else if (cfEverConnected) {
-            // RECONEXÃO AUTOMÁTICA EM 400ms (Nunca derruba o usuário da sala!)
             clearTimeout(controlReconnectTimer);
             controlReconnectTimer = setTimeout(connectControlWs, 400);
           }
@@ -563,7 +579,6 @@ export default function App() {
     connectControlWs();
     connectMediaWs();
 
-    // Heartbeat a cada 15 segundos nos DOIS sockets: impede o timeout de 100s/5min da Cloudflare!
     heartbeatTimer = setInterval(() => {
       if (controlWs && controlWs.readyState === 1) {
         try { controlWs.send('ping'); } catch (e) {}
@@ -689,10 +704,10 @@ export default function App() {
       const text = await navigator.clipboard.readText();
       if (!text) return;
       const { cleanRoom, cleanPass } = parseRoomInput(text, roomPassword);
-      setRoomName(cleanRoom);
+      if (cleanRoom) setRoomName(cleanRoom);
       if (cleanPass) setRoomPassword(cleanPass);
     } catch (e) {
-      alert('Cole o link diretamente no campo "Nome da sala" (Ctrl+V).');
+      alert('Cole o link diretamente no campo da sala (Ctrl+V).');
     }
   };
 
@@ -707,7 +722,6 @@ export default function App() {
     let currentCodecStr = 'vp8';
     let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
-    const abortCtrl = new AbortController();
 
     ramClipBuffersRef.current[streamId] = createZeroCpuChunkBuffer();
 
@@ -758,7 +772,8 @@ export default function App() {
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
     let audioEncoder = null;
-    if (!isCamera && 'AudioEncoder' in window) {
+    const aTrack = mediaStream.getAudioTracks()[0];
+    if (!isCamera && aTrack && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window) {
       try {
         audioEncoder = new AudioEncoder({
           output: (chunk) => {
@@ -777,78 +792,18 @@ export default function App() {
         });
         audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 64000 });
 
-        let usingDesktopWasapi = false;
-        try {
-          const excludeFlag = excludeDiscordRef.current ? 1 : 0;
-          const response = await fetch(`http://127.0.0.1:19876/clean-audio?exclude=${excludeFlag}`, {
-            signal: abortCtrl.signal
-          });
-          if (response.ok && response.body) {
-            usingDesktopWasapi = true;
-            setDesktopBridgeActive(true);
-            setDiscordIsolatedActive(excludeDiscordRef.current);
-
-            mediaStream.getAudioTracks().forEach(t => {
-              t.enabled = false;
-              t.stop();
-            });
-
-            const reader = response.body.getReader();
-            let leftover = new Uint8Array(0);
-            const frameBytes = 1920 * 4;
-            let timestampUs = 0;
-
-            (async () => {
-              while (running) {
-                const { value, done } = await reader.read();
-                if (done || !value) break;
-
-                const combined = new Uint8Array(leftover.length + value.length);
-                combined.set(leftover, 0);
-                combined.set(value, leftover.length);
-
-                let offset = 0;
-                while (offset + frameBytes <= combined.length) {
-                  const slice = combined.subarray(offset, offset + frameBytes);
-                  offset += frameBytes;
-
-                  if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 3) {
-                    const ad = new AudioData({
-                      format: 's16',
-                      sampleRate: 48000,
-                      numberOfFrames: 1920,
-                      numberOfChannels: 2,
-                      timestamp: timestampUs,
-                      data: slice
-                    });
-                    audioEncoder.encode(ad);
-                    ad.close();
-                    timestampUs += 40000;
-                  }
-                }
-                leftover = combined.slice(offset);
-              }
-            })().catch(() => {});
+        const aProc = new MediaStreamTrackProcessor({ track: aTrack });
+        const aReader = aProc.readable.getReader();
+        (async () => {
+          while (running) {
+            const { value: aData, done } = await aReader.read();
+            if (done || !aData) break;
+            if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 3) {
+              audioEncoder.encode(aData);
+            }
+            aData.close();
           }
-        } catch (e) {}
-
-        if (!usingDesktopWasapi) {
-          const aTrack = mediaStream.getAudioTracks()[0];
-          if (aTrack && 'MediaStreamTrackProcessor' in window) {
-            const aProc = new MediaStreamTrackProcessor({ track: aTrack });
-            const aReader = aProc.readable.getReader();
-            (async () => {
-              while (running) {
-                const { value: aData, done } = await aReader.read();
-                if (done || !aData) break;
-                if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 3) {
-                  audioEncoder.encode(aData);
-                }
-                aData.close();
-              }
-            })().catch(() => {});
-          }
-        }
+        })().catch(() => {});
       } catch (e) {}
     }
 
@@ -874,7 +829,6 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              // Keyframe a cada 240 frames (4s) para evitar picos de tráfego na Cloudflare
               const isKey = forceKey || (frameCount % 240 === 0);
               if (isKey) {
                 forceKey = false;
@@ -904,8 +858,6 @@ export default function App() {
       },
       stop: () => {
         running = false;
-        abortCtrl.abort();
-        setDiscordIsolatedActive(false);
         try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
         try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch (e) {}
       }
@@ -1021,7 +973,7 @@ export default function App() {
       transportRef.current.sendControl('start-stream', { meta, ...meta });
       await startWebCodecsSender(newId, mediaStream, true);
     } catch (err) {
-      alert('Não foi possível acessar a webcam.');
+      alert('Não foi possível acessar a câmera.');
     }
   };
 
@@ -1091,22 +1043,21 @@ export default function App() {
 
   if (!inRoom) {
     return (
-      <div className="h-screen w-screen bg-[#0D0F13] flex items-center justify-center p-4">
+      <div className="min-h-[100dvh] w-screen bg-[#0D0F13] flex items-center justify-center p-4">
         <div className="w-full max-w-sm bg-[#151922] border border-[#232936] rounded-xl p-6 shadow-2xl">
           <div className="flex items-center justify-between mb-6">
             {renderVogelsLogo('text-2xl')}
-            {desktopBridgeActive && (
-              <span className="text-[11px] bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 px-2 py-0.5 rounded font-medium">
-                App Windows Ativo
-              </span>
-            )}
           </div>
           <form
             onSubmit={(e) => {
               e.preventDefault();
+              const cleanNick = nickname.trim();
+              if (!cleanNick || !cleanRoom) return;
+              setNickname(cleanNick);
               setRoomName(cleanRoom);
               if (cleanPass) setRoomPassword(cleanPass);
-              if (nickname.trim() && cleanRoom) setInRoom(true);
+              saveRoomToHistory(cleanRoom, cleanPass, cleanNick);
+              setInRoom(true);
             }}
             className="space-y-4"
           >
@@ -1117,19 +1068,20 @@ export default function App() {
                 required
                 value={nickname}
                 onChange={e => setNickname(e.target.value)}
-                placeholder="Ex: gosadinhas"
+                placeholder="Digite seu nome"
                 className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white select-text focus:outline-none focus:border-red-500"
               />
             </div>
+
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <label className="block text-xs text-gray-400 font-medium">Nome da sala (ou cole o link)</label>
+                <label className="block text-xs text-gray-400 font-medium">Sala</label>
                 <button
                   type="button"
                   onClick={handlePasteRoomLink}
                   className="text-[11px] text-red-400 hover:text-red-300 cursor-pointer"
                 >
-                  📋 Colar link da sala
+                  📋 Colar link
                 </button>
               </div>
               <input
@@ -1137,20 +1089,45 @@ export default function App() {
                 required
                 value={roomName}
                 onChange={e => setRoomName(e.target.value)}
-                placeholder="Ex: squad-brasil"
+                placeholder="Digite a sala"
                 className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white select-text focus:outline-none focus:border-red-500"
               />
             </div>
+
             <div>
-              <label className="block text-xs text-gray-400 mb-1.5 font-medium">Senha da sala (opcional)</label>
+              <label className="block text-xs text-gray-400 mb-1.5 font-medium">Senha (opcional)</label>
               <input
-                type="text"
+                type="password"
                 value={roomPassword}
                 onChange={e => setRoomPassword(e.target.value)}
-                placeholder="Deixe vazio se a sala não tiver senha"
+                placeholder="Digitar senha"
                 className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white select-text focus:outline-none focus:border-red-500"
               />
             </div>
+
+            {/* Item 4: Últimas 3 salas abaixo de digitar senha (se não houver nenhuma, não aparece nada) */}
+            {recentRooms.length > 0 && (
+              <div className="pt-1 space-y-1.5">
+                <span className="block text-[11px] text-gray-400 font-medium">
+                  Últimas salas:
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {recentRooms.map((item) => (
+                    <button
+                      key={item.room}
+                      type="button"
+                      onClick={() => handleQuickJoinRecentRoom(item)}
+                      className="flex items-center gap-1.5 bg-[#1B202B] hover:bg-[#252C3D] border border-[#2C3446] hover:border-red-500/50 text-xs text-gray-200 px-3 py-1.5 rounded-lg cursor-pointer transition"
+                      title={`Entrar automaticamente na sala ${item.room}`}
+                    >
+                      <span>{item.pass ? '🔒' : '🚪'}</span>
+                      <span className="font-mono font-medium truncate max-w-[120px]">{item.room}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <button
               type="submit"
               className="w-full bg-[#5865F2] hover:bg-[#4752C4] text-white font-semibold py-2.5 rounded-lg text-sm transition cursor-pointer mt-2"
@@ -1169,47 +1146,47 @@ export default function App() {
   const remoteStreams = streams.filter(s => !s.isLocal);
 
   return (
-    <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col overflow-hidden">
-      <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20 select-none">
-        <div className="flex items-center gap-2">
-          {renderVogelsLogo('text-base')}
+    <div className="h-[100dvh] w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col overflow-hidden">
+      {/* BARRA SUPERIOR AJUSTADA PARA PC E MOBILE */}
+      <header className="min-h-12 bg-[#12151C] border-b border-[#1E232E] px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-1.5 shrink-0 z-20 select-none">
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          {renderVogelsLogo('text-sm sm:text-base')}
           <span className="text-amber-400 text-xs">🔒</span>
-          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-200 px-2 py-0.5 rounded-full font-mono">
+          <span className="bg-[#1B202B] border border-[#262C3A] text-[10px] sm:text-[11px] text-gray-200 px-2 py-0.5 rounded-full font-mono truncate max-w-[90px] sm:max-w-[160px]">
             {cleanRoom}
           </span>
-          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-emerald-400 px-2 py-0.5 rounded-full font-medium">
+          <span className="bg-[#1B202B] border border-[#262C3A] text-[10px] sm:text-[11px] text-emerald-400 px-2 py-0.5 rounded-full font-medium shrink-0">
             {participants.length} online
           </span>
-          {discordIsolatedActive && (
-            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full">
-              🛡️ Discord Isolado na Live
-            </span>
-          )}
         </div>
 
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <select value={quality} onChange={e => setQuality(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            <option value="720p">720p (HD)</option>
-            <option value="1080p">1080p (Full HD)</option>
-            <option value="1440p">2K (1440p)</option>
-          </select>
+        <div className="flex items-center gap-1 sm:gap-1.5 flex-wrap">
+          {canShareScreen && (
+            <>
+              <select value={quality} onChange={e => setQuality(e.target.value)} className="hidden md:inline-block bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2 py-1.5 cursor-pointer">
+                <option value="720p">720p (HD)</option>
+                <option value="1080p">1080p (Full HD)</option>
+                <option value="1440p">2K (1440p)</option>
+              </select>
 
-          <select
-            value={bitrateKbps}
-            onChange={e => setBitrateKbps(Number(e.target.value))}
-            className="bg-[#171B24] border border-emerald-500/40 text-xs text-emerald-300 font-semibold rounded-md px-2.5 py-1.5 cursor-pointer"
-            title="Taxa de Bits Inteligente (VBR)"
-          >
-            <option value={2500}>2500 kbps (Econômico)</option>
-            <option value={4000}>4000 kbps (VBR HD · Estável)</option>
-            <option value={6000}>6000 kbps (VBR Ultra)</option>
-            <option value={8000}>8000 kbps (8K Máximo)</option>
-          </select>
+              <select
+                value={bitrateKbps}
+                onChange={e => setBitrateKbps(Number(e.target.value))}
+                className="hidden md:inline-block bg-[#171B24] border border-emerald-500/40 text-xs text-emerald-300 font-semibold rounded-md px-2 py-1.5 cursor-pointer"
+                title="Taxa de Bits Inteligente (VBR)"
+              >
+                <option value={2500}>2500 kbps</option>
+                <option value={4000}>4000 kbps (VBR)</option>
+                <option value={6000}>6000 kbps</option>
+                <option value={8000}>8000 kbps</option>
+              </select>
 
-          <select value={fps} onChange={e => setFps(Number(e.target.value))} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            <option value={30}>30 fps</option>
-            <option value={60}>60 fps</option>
-          </select>
+              <select value={fps} onChange={e => setFps(Number(e.target.value))} className="hidden md:inline-block bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2 py-1.5 cursor-pointer">
+                <option value={30}>30 fps</option>
+                <option value={60}>60 fps</option>
+              </select>
+            </>
+          )}
 
           <div className="relative">
             <button
@@ -1217,15 +1194,15 @@ export default function App() {
                 setShowMixer(!showMixer);
                 setShowSettings(false);
               }}
-              className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer ${
+              className={`border text-[11px] sm:text-xs rounded-md px-2 sm:px-2.5 py-1.5 flex items-center gap-1 cursor-pointer ${
                 showMixer ? 'bg-red-600/30 border-red-500 text-white' : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
               }`}
             >
-              <span>🎚️</span> Mixer
+              <span>🎚️</span> <span className="hidden sm:inline">Mixer</span>
             </button>
 
             {showMixer && (
-              <div className="absolute right-0 mt-2 w-80 bg-[#141820] border border-[#262C3A] rounded-xl shadow-2xl p-4 z-50 text-left space-y-4">
+              <div className="fixed sm:absolute right-2 sm:right-0 top-13 sm:top-auto sm:mt-2 w-[calc(100vw-1rem)] max-w-xs bg-[#141820] border border-[#262C3A] rounded-xl shadow-2xl p-4 z-50 text-left space-y-4">
                 <div className="flex items-center justify-between border-b border-[#222834] pb-2">
                   <span className="font-semibold text-sm text-white">🎚️ Mixer de Áudio (0% a 100%)</span>
                   <button onClick={() => setShowMixer(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
@@ -1246,20 +1223,22 @@ export default function App() {
                   />
                 </div>
 
-                <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3 space-y-1.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-medium text-white">🎙️ Volume da Sua Live (Envio)</span>
-                    <span className="font-mono text-indigo-400 font-semibold">{outgoingVolume}%</span>
+                {canShareScreen && (
+                  <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium text-white">🎙️ Volume da Sua Live (Envio)</span>
+                      <span className="font-mono text-indigo-400 font-semibold">{outgoingVolume}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={outgoingVolume}
+                      onChange={e => setOutgoingVolume(Number(e.target.value))}
+                      className="w-full accent-indigo-500 cursor-pointer"
+                    />
                   </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={outgoingVolume}
-                    onChange={e => setOutgoingVolume(Number(e.target.value))}
-                    className="w-full accent-indigo-500 cursor-pointer"
-                  />
-                </div>
+                )}
 
                 <div className="space-y-2">
                   <span className="block text-[11px] font-semibold uppercase tracking-wider text-gray-400">
@@ -1300,32 +1279,36 @@ export default function App() {
             )}
           </div>
 
-          <button onClick={handleShareCamera} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer">
-            <span>📷</span> Câmera
+          <button onClick={handleShareCamera} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-[11px] sm:text-xs text-gray-200 rounded-md px-2 sm:px-2.5 py-1.5 flex items-center gap-1 cursor-pointer">
+            <span>📷</span> <span className="hidden sm:inline">Câmera</span>
           </button>
 
           {watchingStreams.length > 0 && (
             <button
               onClick={() => handleReplayOrClip(watchingStreams[0].id)}
-              className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer"
+              className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-[11px] sm:text-xs text-gray-200 rounded-md px-2 sm:px-2.5 py-1.5 flex items-center gap-1 cursor-pointer"
               title="Voltar 30 segundos do compartilhamento"
             >
-              <span>⏪</span> Replay 30s
+              <span>⏪</span> <span className="hidden sm:inline">Replay 30s</span>
             </button>
           )}
 
-          <button
-            onClick={() => setGameMode(!gameMode)}
-            className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer ${
-              gameMode ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200' : 'bg-[#171B24] border-[#282E3D] text-gray-200'
-            }`}
-          >
-            <span>🎮</span> Modo jogo
-          </button>
+          {canShareScreen && (
+            <>
+              <button
+                onClick={() => setGameMode(!gameMode)}
+                className={`hidden md:flex border text-xs rounded-md px-2.5 py-1.5 items-center gap-1.5 cursor-pointer ${
+                  gameMode ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200' : 'bg-[#171B24] border-[#282E3D] text-gray-200'
+                }`}
+              >
+                <span>🎮</span> Modo jogo
+              </button>
 
-          <button onClick={handleShareScreen} className="bg-[#5865F2] hover:bg-[#4752C4] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer">
-            Compartilhar tela
-          </button>
+              <button onClick={handleShareScreen} className="bg-[#5865F2] hover:bg-[#4752C4] text-white font-medium text-[11px] sm:text-xs rounded-md px-2.5 sm:px-3 py-1.5 cursor-pointer">
+                Compartilhar tela
+              </button>
+            </>
+          )}
 
           <div className="relative">
             <button
@@ -1333,12 +1316,12 @@ export default function App() {
                 setShowSettings(!showSettings);
                 setShowMixer(false);
               }}
-              className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer"
+              className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2 py-1.5 cursor-pointer"
             >
               ⚙️
             </button>
             {showSettings && (
-              <div className="absolute right-0 mt-2 w-80 bg-[#141820] border border-[#262C3A] rounded-xl shadow-2xl p-4 z-50 text-left space-y-3.5">
+              <div className="fixed sm:absolute right-2 sm:right-0 top-13 sm:top-auto sm:mt-2 w-[calc(100vw-1rem)] max-w-xs bg-[#141820] border border-[#262C3A] rounded-xl shadow-2xl p-4 z-50 text-left space-y-3.5">
                 <div className="flex items-center justify-between border-b border-[#222834] pb-2">
                   <span className="font-semibold text-sm text-white">Configurações</span>
                   <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
@@ -1346,7 +1329,7 @@ export default function App() {
 
                 <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-white">Mutar Discord na stream (Anti-Eco)</span>
+                    <span className="text-xs font-semibold text-white">Isolar áudio da janela (Anti-Eco)</span>
                     <input
                       type="checkbox"
                       checked={excludeDiscordAudio}
@@ -1355,7 +1338,7 @@ export default function App() {
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Vem ativado por padrão no App Baixável: quem assiste à sua live não escuta o seu Discord (evita vozes duplicadas), mas você continua ouvindo seus amigos normalmente.
+                    Ao compartilhar uma janela ou aba específica, captura apenas o som dela sem transmitir vozes externas.
                   </p>
                 </div>
 
@@ -1371,43 +1354,38 @@ export default function App() {
             )}
           </div>
 
-          <a
-            href="/VogelsTV.exe"
-            download="VogelsTV.exe"
-            onClick={() => {
-              try { navigator.clipboard.writeText(currentRoomUrl); } catch (e) {}
-            }}
-            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer inline-flex items-center"
-            title="Baixar aplicativo VogelsTV.exe com isolamento de voz do Discord por padrão"
-          >
-            Baixar app
-          </a>
-
-          <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            🔗 Link
+          <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-[11px] sm:text-xs text-gray-200 rounded-md px-2 sm:px-2.5 py-1.5 cursor-pointer">
+            🔗 <span className="hidden sm:inline">Link</span>
           </button>
 
           <button
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1 cursor-pointer transition ${
+            className={`border text-[11px] sm:text-xs rounded-md px-2 sm:px-2.5 py-1.5 flex items-center gap-1 cursor-pointer transition ${
               sidebarCollapsed
                 ? 'bg-red-600/25 border-red-500/60 text-red-200'
                 : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
             }`}
           >
-            <span>💬</span> {sidebarCollapsed ? 'Abrir Chat' : 'Ocultar Chat'}
+            <span>💬</span> <span className="hidden sm:inline">{sidebarCollapsed ? 'Abrir Chat' : 'Ocultar Chat'}</span>
           </button>
 
-          <button onClick={() => setInRoom(false)} className="bg-[#171B24] hover:bg-red-950/60 border border-red-800/60 text-xs text-red-300 rounded-md px-2.5 py-1.5 cursor-pointer">
+          <button onClick={() => setInRoom(false)} className="bg-[#171B24] hover:bg-red-950/60 border border-red-800/60 text-[11px] sm:text-xs text-red-300 rounded-md px-2 sm:px-2.5 py-1.5 cursor-pointer">
             Sair
           </button>
         </div>
       </header>
 
-      <div className="flex-1 flex overflow-hidden relative">
-        <main className="flex-1 bg-[#0B0D11] relative flex flex-col p-3 overflow-hidden select-none">
+      {/* CORPO PRINCIPAL: EMPILHADO NO MOBILE (flex-col) E LADO A LADO NO DESKTOP (lg:flex-row) */}
+      <div className="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
+        <main
+          className={`bg-[#0B0D11] relative flex flex-col p-2 sm:p-3 overflow-hidden select-none ${
+            !sidebarCollapsed && watchingStreams.length > 0
+              ? 'h-[45dvh] sm:h-[52dvh] lg:h-auto lg:flex-1 shrink-0'
+              : 'flex-1'
+          }`}
+        >
           {watchingStreams.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3">
+            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3 p-4">
               {unwatchedStreams.length > 0 ? (
                 <div className="space-y-3">
                   <p className="text-xs text-gray-300">
@@ -1428,14 +1406,20 @@ export default function App() {
               ) : (
                 <div>
                   <p className="text-xs text-gray-400">Ninguém está compartilhando ainda.</p>
-                  <p className="text-xs text-gray-400 mt-0.5">
-                    Clique em <button onClick={handleShareScreen} className="text-gray-200 font-semibold hover:underline cursor-pointer">Compartilhar tela</button> para começar.
-                  </p>
+                  {canShareScreen ? (
+                    <p className="text-xs text-gray-400 mt-0.5">
+                      Clique em <button onClick={handleShareScreen} className="text-gray-200 font-semibold hover:underline cursor-pointer">Compartilhar tela</button> para começar.
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-gray-500 mt-1">
+                      Assim que alguém iniciar uma live na sala, ela aparecerá aqui automaticamente.
+                    </p>
+                  )}
                 </div>
               )}
             </div>
           ) : (
-            <div className={`flex-1 grid gap-3 overflow-hidden ${expandedId || watchingStreams.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
+            <div className={`flex-1 grid gap-2 sm:gap-3 overflow-hidden ${expandedId || watchingStreams.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
               {watchingStreams
                 .filter(s => !expandedId || s.id === expandedId)
                 .map(streamObj =>
@@ -1461,25 +1445,26 @@ export default function App() {
           )}
 
           {minimizedStreams.length > 0 && (
-            <div className="mt-2 flex items-center gap-2 bg-[#141820] border border-[#232936] px-3 py-1.5 rounded-lg">
-              <span className="text-[11px] text-gray-400">Minimizadas:</span>
+            <div className="mt-2 flex items-center gap-2 bg-[#141820] border border-[#232936] px-3 py-1.5 rounded-lg overflow-x-auto">
+              <span className="text-[11px] text-gray-400 shrink-0">Minimizadas:</span>
               {minimizedStreams.map(s => (
-                <button key={s.id} onClick={() => setStreams(prev => prev.map(x => x.id === s.id ? { ...x, minimized: false } : x))} className="text-xs bg-[#1E2433] text-indigo-300 px-2 py-0.5 rounded cursor-pointer">
+                <button key={s.id} onClick={() => setStreams(prev => prev.map(x => x.id === s.id ? { ...x, minimized: false } : x))} className="text-xs bg-[#1E2433] text-indigo-300 px-2 py-0.5 rounded cursor-pointer shrink-0">
                   Restaurar: {s.owner}
                 </button>
               ))}
             </div>
           )}
 
-          <div className="absolute bottom-1.5 left-3 text-[11px] opacity-60 pointer-events-none">
+          <div className="hidden sm:block absolute bottom-1.5 left-3 text-[11px] opacity-60 pointer-events-none">
             {renderVogelsLogo('text-xs')}
           </div>
         </main>
 
+        {/* PAINEL DE PARTICIPANTES + CHAT (Responsivo no Mobile e Retrátil) */}
         {!sidebarCollapsed && (
-          <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0 transition-all">
-            <div className="p-3 border-b border-[#1E232E] select-none">
-              <div className="flex items-center justify-between mb-2">
+          <aside className="flex-1 lg:flex-none lg:w-72 bg-[#12151C] border-t lg:border-t-0 lg:border-l border-[#1E232E] flex flex-col min-h-0 shrink-0 transition-all">
+            <div className="p-2.5 sm:p-3 border-b border-[#1E232E] select-none max-h-28 lg:max-h-48 overflow-y-auto">
+              <div className="flex items-center justify-between mb-1.5">
                 <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase">PARTICIPANTES</h3>
                 <button
                   onClick={() => setSidebarCollapsed(true)}
@@ -1488,7 +1473,7 @@ export default function App() {
                   ❯ Minimizar
                 </button>
               </div>
-              <div className="space-y-1.5">
+              <div className="space-y-1">
                 {participants.map(p => {
                   const isMe = p.id === myId || p.id === persistentClientIdRef.current;
                   const userStreams = isMe
@@ -1538,9 +1523,9 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex-1 flex flex-col p-3 overflow-hidden select-text">
-              <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2 select-none">CHAT</h3>
-              <div className="flex-1 bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 overflow-y-auto space-y-2 text-xs">
+            <div className="flex-1 flex flex-col p-2.5 sm:p-3 min-h-0 overflow-hidden select-text">
+              <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-1.5 select-none">CHAT</h3>
+              <div className="flex-1 bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 overflow-y-auto space-y-2 text-xs min-h-0">
                 {messages.map(m =>
                   m.system ? (
                     <p key={m.id} className="text-gray-400 italic text-[11px]">{m.text}</p>
@@ -1554,7 +1539,7 @@ export default function App() {
                 )}
                 <div ref={chatEndRef} />
               </div>
-              <form onSubmit={sendChat} className="mt-2 flex gap-1.5">
+              <form onSubmit={sendChat} className="mt-2 flex gap-1.5 shrink-0">
                 <input
                   type="text"
                   value={chatInput}
@@ -1562,11 +1547,11 @@ export default function App() {
                   onKeyDown={e => e.stopPropagation()}
                   placeholder="Digite sua mensagem..."
                   autoComplete="off"
-                  className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white select-text cursor-text focus:outline-none focus:border-red-500"
+                  className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-2 sm:py-1.5 text-xs text-white select-text cursor-text focus:outline-none focus:border-red-500"
                 />
                 <button
                   type="submit"
-                  className="bg-[#5865F2] hover:bg-[#4752C4] text-xs font-medium text-white px-3 py-1.5 rounded-md cursor-pointer transition"
+                  className="bg-[#5865F2] hover:bg-[#4752C4] text-xs font-medium text-white px-3.5 py-2 sm:py-1.5 rounded-md cursor-pointer transition shrink-0"
                 >
                   Enviar
                 </button>
@@ -1697,14 +1682,14 @@ function ReplayPlayerModal({ replayModal, watchingStreams, onSelectStream, onClo
   };
 
   return (
-    <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50 select-none">
-      <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-3xl p-4 space-y-3 shadow-2xl">
+    <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-3 sm:p-4 z-50 select-none">
+      <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-3xl p-3 sm:p-4 space-y-3 shadow-2xl">
         <div className="flex items-center justify-between flex-wrap gap-2 border-b border-[#222834] pb-2.5">
-          <h4 className="text-sm font-bold text-white">
+          <h4 className="text-xs sm:text-sm font-bold text-white">
             ⏪ Replay Instantâneo (Últimos 30s) — <span className="text-red-400">{replayModal.owner}</span>
           </h4>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             {watchingStreams.length > 1 && (
               <select
                 value={replayModal.streamId}
@@ -1736,7 +1721,7 @@ function ReplayPlayerModal({ replayModal, watchingStreams, onSelectStream, onClo
 
         <canvas
           ref={canvasRef}
-          className="w-full rounded-lg bg-black max-h-[72vh] object-contain"
+          className="w-full rounded-lg bg-black max-h-[68vh] object-contain"
         />
       </div>
     </div>
@@ -1759,20 +1744,26 @@ function VideoTile({
   onClip,
   onReplay
 }) {
+  const tileRef = useRef(null);
   const localVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, kbps: 0 });
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimerRef = useRef(null);
 
-  const handleMouseMoveTile = () => {
-    setControlsVisible(true);
+  const scheduleAutoHide = () => {
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     hideTimerRef.current = setTimeout(() => {
       setControlsVisible(false);
     }, 2500);
+  };
+
+  const handleMouseMoveTile = () => {
+    setControlsVisible(true);
+    scheduleAutoHide();
   };
 
   const handleMouseLeaveTile = () => {
@@ -1780,9 +1771,50 @@ function VideoTile({
     setControlsVisible(false);
   };
 
+  // Sugestão 2: Toque na tela do vídeo (Mobile/PC) alterna mostrar/ocultar os controles estilo YouTube App
+  const handleToggleControlsOnTap = () => {
+    setControlsVisible(prev => {
+      const next = !prev;
+      if (next) {
+        scheduleAutoHide();
+      } else if (hideTimerRef.current) {
+        clearTimeout(hideTimerRef.current);
+      }
+      return next;
+    });
+  };
+
+  // Sugestão 1: Tela Cheia Nativa (Fullscreen API no PC e Celular)
+  const handleToggleFullscreen = async () => {
+    try {
+      const el = tileRef.current;
+      if (!el) return;
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+        if (el.requestFullscreen) {
+          await el.requestFullscreen();
+        } else if (el.webkitRequestFullscreen) {
+          el.webkitRequestFullscreen();
+        }
+      } else {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+          document.webkitExitFullscreen();
+        }
+      }
+    } catch (e) {}
+  };
+
   useEffect(() => {
-    hideTimerRef.current = setTimeout(() => setControlsVisible(false), 3000);
+    const onFsChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement || document.webkitFullscreenElement));
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+    scheduleAutoHide();
     return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     };
   }, []);
@@ -2009,9 +2041,12 @@ function VideoTile({
 
   return (
     <div
+      ref={tileRef}
       onMouseMove={handleMouseMoveTile}
       onMouseEnter={handleMouseMoveTile}
       onMouseLeave={handleMouseLeaveTile}
+      onClick={handleToggleControlsOnTap}
+      onDoubleClick={handleToggleFullscreen}
       className={`relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center ${
         controlsVisible ? 'cursor-default' : 'cursor-none'
       }`}
@@ -2031,22 +2066,26 @@ function VideoTile({
         />
       )}
 
+      {/* Etiqueta Superior (Oculta após 2.5s ou ao tocar na tela) */}
       <div
-        className={`absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs transition-opacity duration-300 ${
+        onClick={e => e.stopPropagation()}
+        className={`absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-[11px] sm:text-xs transition-opacity duration-300 ${
           controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
         <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
         <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
-        <span className="text-emerald-300 font-mono text-[11px]">
+        <span className="text-emerald-300 font-mono text-[10px] sm:text-[11px]">
           {streamObj.isLocal
             ? `· ${streamObj.res} · ${streamObj.fps} FPS · Local`
             : `· ${stats.h ? stats.h + 'p' : streamObj.res} · ${stats.fps} FPS · ${stats.kbps} kbps`}
         </span>
       </div>
 
+      {/* Barra de Controles Inferior (Responsiva no Mobile + Tela Cheia Nativa) */}
       <div
-        className={`absolute bottom-2.5 right-2.5 z-30 flex items-center gap-2 bg-black/85 px-2.5 py-1.5 rounded-lg border border-white/10 transition-opacity duration-300 ${
+        onClick={e => e.stopPropagation()}
+        className={`absolute bottom-2 right-2 left-2 sm:left-auto z-30 flex flex-wrap items-center justify-end gap-1.5 bg-black/85 px-2 py-1.5 rounded-lg border border-white/10 transition-opacity duration-300 ${
           controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
@@ -2065,7 +2104,7 @@ function VideoTile({
               max="100"
               value={currentVol}
               onChange={(e) => onVolumeChange(e.target.value)}
-              className="w-20 h-1.5 accent-red-500 cursor-pointer"
+              className="w-16 sm:w-20 h-1.5 accent-red-500 cursor-pointer"
               title={`Volume: ${currentVol}%`}
             />
             <span className="text-[10px] font-mono text-gray-200 w-7 text-right">
@@ -2073,19 +2112,26 @@ function VideoTile({
             </span>
           </div>
         )}
-        <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">🎬 Clipe 30s</button>
-        <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
-        <button onClick={onMinimize} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">_ Minimizar</button>
-        <button onClick={onExpand} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
-          {isExpanded ? '🗗 Restaurar' : '⛶ Expandir'}
+        <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[10px] sm:text-[11px] px-2 py-1 rounded cursor-pointer">🎬 Clipe</button>
+        <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[10px] sm:text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
+        <button onClick={onMinimize} className="hidden sm:inline-block bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">_ Minimizar</button>
+        <button onClick={onExpand} className="hidden sm:inline-block bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
+          {isExpanded ? '🗗 Restaurar' : '🗖 Expandir'}
+        </button>
+        <button
+          onClick={handleToggleFullscreen}
+          className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[10px] sm:text-[11px] px-2 py-1 rounded cursor-pointer font-medium"
+          title="Tela Cheia (ou dê duplo clique no vídeo)"
+        >
+          {isFullscreen ? '🗗 Sair Tela Cheia' : '⛶ Tela Cheia'}
         </button>
         {!streamObj.isLocal && (
-          <button onClick={onStopWatching} className="bg-red-600/80 hover:bg-red-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">
-            Parar de assistir
+          <button onClick={onStopWatching} className="bg-red-600/80 hover:bg-red-600 text-white text-[10px] sm:text-[11px] px-2 py-1 rounded cursor-pointer">
+            Parar
           </button>
         )}
         {streamObj.isLocal && (
-          <button onClick={onStop} className="bg-red-600/80 hover:bg-red-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">
+          <button onClick={onStop} className="bg-red-600/80 hover:bg-red-600 text-white text-[10px] sm:text-[11px] px-2.5 py-1 rounded cursor-pointer">
             Parar
           </button>
         )}

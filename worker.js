@@ -1,10 +1,10 @@
 export class RoomDO {
   constructor(state, env) {
     this.state = state;
-    this.controlSessions = new Map(); // ws -> { id, nick }
-    this.mediaSessions = new Set();   // ws exclusivos de vídeo/áudio
-    this.activeStreams = new Map();   // streamId -> meta
-    this.disconnectTimers = new Map(); // clientId -> timeoutId
+    this.controlSessions = new Map();
+    this.mediaSessions = new Set();
+    this.activeStreams = new Map();
+    this.disconnectTimers = new Map();
   }
 
   async fetch(request) {
@@ -20,7 +20,6 @@ export class RoomDO {
     const [client, server] = Object.values(pair);
     server.accept();
 
-    // Canal de mídia binária com suporte a keep-alive
     if (role === 'media') {
       this.mediaSessions.add(server);
       server.addEventListener('message', (event) => {
@@ -40,7 +39,6 @@ export class RoomDO {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // Canal de Controle e Chat com ID persistente (não derruba na reconexão!)
     let clientId = url.searchParams.get('cid') || crypto.randomUUID();
     this.controlSessions.set(server, { id: clientId, nick: 'Conectando...' });
 
@@ -83,7 +81,6 @@ export class RoomDO {
 
         if (data.type === 'join-room') {
           if (data.clientId) clientId = String(data.clientId).slice(0, 40);
-          // Cancela qualquer timer de desconexão pendente deste usuário (reconexão transparente!)
           if (this.disconnectTimers.has(clientId)) {
             clearTimeout(this.disconnectTimers.get(clientId));
             this.disconnectTimers.delete(clientId);
@@ -133,7 +130,6 @@ export class RoomDO {
 
     const cleanup = () => {
       this.controlSessions.delete(server);
-      // Verifica se o mesmo usuário já não está conectado em outro socket ativo
       let stillConnected = false;
       for (const u of this.controlSessions.values()) {
         if (u.id === clientId) {
@@ -143,7 +139,6 @@ export class RoomDO {
       }
       if (stillConnected) return;
 
-      // Aguarda 6 segundos antes de remover o usuário/stream (permite reconexão automática sem kickar ninguém!)
       const timer = setTimeout(() => {
         this.disconnectTimers.delete(clientId);
         let reconnected = false;
@@ -177,19 +172,10 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === '/ws') {
-      const roomKey = (url.searchParams.get('room') || 'squad-brasil').toLowerCase().slice(0, 60);
+      const roomKey = (url.searchParams.get('room') || 'geral').toLowerCase().slice(0, 60);
       const id = env.ROOMS.idFromName(roomKey);
       const stub = env.ROOMS.get(id);
       return stub.fetch(request);
-    }
-
-    if (url.pathname === '/VogelsTV.exe' || url.pathname === '/api/download-app') {
-      const assetReq = new Request(new URL('/VogelsTV.exe', request.url), request);
-      const res = await env.ASSETS.fetch(assetReq);
-      const headers = new Headers(res.headers);
-      headers.set('Content-Type', 'application/octet-stream');
-      headers.set('Content-Disposition', 'attachment; filename="VogelsTV.exe"');
-      return new Response(res.body, { status: res.status, headers });
     }
 
     return env.ASSETS.fetch(request);
