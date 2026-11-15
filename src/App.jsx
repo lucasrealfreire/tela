@@ -14,7 +14,6 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
   const candidates = [
     preferredCodec === 'H264' ? { codec: 'avc1.640033', avc: { format: 'annexb' } } : null,
     preferredCodec === 'VP9' ? { codec: 'vp09.00.10.08' } : null,
-    preferredCodec === 'AV1' ? { codec: 'av01.0.08M.08' } : null,
     { codec: 'vp8' },
     { codec: 'avc1.42002a', avc: { format: 'annexb' } }
   ].filter(Boolean);
@@ -41,7 +40,7 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
 
 export default function App() {
   const [inRoom, setInRoom] = useState(false);
-  const [nickname, setNickname] = useState(() => localStorage.getItem('tl_nick') || 'gosadinhas');
+  const [nickname, setNickname] = useState(() => localStorage.getItem('tv_nick') || 'gosadinhas');
   const [roomName, setRoomName] = useState('squad-brasil');
 
   const [quality, setQuality] = useState('1080p');
@@ -50,12 +49,20 @@ export default function App() {
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
-  const [smoothness, setSmoothness] = useState('responsive');
+  // Opção ATIVADA POR PADRÃO para mutar o Discord por completo ao compartilhar a tela
+  const [muteDiscordOnShare, setMuteDiscordOnShare] = useState(() => {
+    const saved = localStorage.getItem('tv_mute_discord');
+    return saved !== null ? saved === 'true' : true;
+  });
+  const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
+  const [discordCurrentlyMuted, setDiscordCurrentlyMuted] = useState(false);
+
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
-  const [clipDuration, setClipDuration] = useState(30);
+  const [clipDuration] = useState(30);
 
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
@@ -67,9 +74,9 @@ export default function App() {
   const [logs, setLogs] = useState([]);
 
   const socketRef = useRef(null);
-  const activeEncodersRef = useRef({}); // streamId -> { stop(), forceKey() }
-  const videoChunkHandlersRef = useRef({}); // streamId -> fn(meta, buffer)
-  const audioChunkHandlersRef = useRef({}); // streamId -> fn(meta, buffer)
+  const activeEncodersRef = useRef({});
+  const videoChunkHandlersRef = useRef({});
+  const audioChunkHandlersRef = useRef({});
   const clipRecordersRef = useRef({});
   const clipChunksRef = useRef({});
 
@@ -77,18 +84,61 @@ export default function App() {
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
 
-  useEffect(() => {
-    qualityRef.current = quality;
-    fpsRef.current = fps;
-    codecRef.current = codec;
-    // Aplica reconfiguração dinâmica se já estiver transmitindo
-    Object.values(activeEncodersRef.current).forEach(enc => enc.reconfigure?.());
-  }, [quality, fps, codec]);
-
   const addLog = (msg) => {
     const time = new Date().toLocaleTimeString('pt-BR');
     setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
   };
+
+  // Comunica com o processo nativo Windows (TelinhaVogels.exe na porta local 19876) para mutar/desmutar o Discord.exe
+  const setWindowsDiscordMute = async (shouldMute) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:19876/discord-mute?mute=${shouldMute ? 1 : 0}`, {
+        method: 'GET',
+        mode: 'cors'
+      });
+      const data = await res.json();
+      if (data && data.ok) {
+        setDesktopBridgeActive(true);
+        setDiscordCurrentlyMuted(Boolean(data.discordMuted));
+        addLog(
+          shouldMute
+            ? `App Desktop: Discord.exe mutado automaticamente (${data.sessions} sessões WASAPI) para evitar duplicação de voz.`
+            : `App Desktop: Áudio do Discord.exe restaurado.`
+        );
+      }
+    } catch (e) {
+      // Usuário está rodando apenas pelo navegador comum sem o executável aberto
+    }
+  };
+
+  // Detecta se está rodando dentro do Executável Desktop Windows
+  useEffect(() => {
+    const checkBridge = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:19876/ping', { method: 'GET', mode: 'cors' });
+        const data = await res.json();
+        if (data?.ok) setDesktopBridgeActive(true);
+      } catch (e) {}
+    };
+    checkBridge();
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('tv_mute_discord', String(muteDiscordOnShare));
+    const hasLocalScreen = streams.some(s => s.isLocal && s.type !== 'Câmera');
+    if (hasLocalScreen) {
+      setWindowsDiscordMute(muteDiscordOnShare);
+    } else if (!muteDiscordOnShare && discordCurrentlyMuted) {
+      setWindowsDiscordMute(false);
+    }
+  }, [muteDiscordOnShare]);
+
+  useEffect(() => {
+    qualityRef.current = quality;
+    fpsRef.current = fps;
+    codecRef.current = codec;
+    Object.values(activeEncodersRef.current).forEach(enc => enc.reconfigure?.());
+  }, [quality, fps, codec]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -96,7 +146,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('tl_nick', nickname);
+    localStorage.setItem('tv_nick', nickname);
   }, [nickname]);
 
   useEffect(() => {
@@ -106,7 +156,7 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      addLog(`Conectado ao servidor de baixa latência (ID: ${socket.id})`);
+      addLog(`Conectado ao servidor telinha vogels (ID: ${socket.id})`);
       socket.emit('join-room', { roomName, nickname });
     });
 
@@ -155,7 +205,6 @@ export default function App() {
     });
 
     socket.on('v-chunk', (meta, buffer) => {
-      // Se o card do stream ainda não existir (ex: entrou no meio), cria automaticamente
       setStreams(prev => {
         if (prev.some(s => s.id === meta.id)) return prev;
         return [
@@ -193,12 +242,12 @@ export default function App() {
 
     return () => {
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
+      setWindowsDiscordMute(false);
       socket.disconnect();
     };
   }, [inRoom, roomName, nickname]);
 
-  // Motor WebCodecs GPU Sender (Não perde FPS em Alt+Tab nos jogos!)
-  const startWebCodecsSender = async (streamId, mediaStream, streamType) => {
+  const startWebCodecsSender = async (streamId, mediaStream) => {
     const vTrack = mediaStream.getVideoTracks()[0];
     if (!vTrack) return;
 
@@ -210,7 +259,7 @@ export default function App() {
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
 
     const videoEncoder = new VideoEncoder({
-      output: (chunk, metadata) => {
+      output: (chunk) => {
         if (!running) return;
         const buf = new Uint8Array(chunk.byteLength);
         chunk.copyTo(buf);
@@ -232,7 +281,6 @@ export default function App() {
     const configureEncoderNow = async (rawW, rawH) => {
       const cfg = RES_CONFIG[qualityRef.current] || RES_CONFIG['1080p'];
       const targetFps = Number(fpsRef.current) || 60;
-      // Mantém a proporção real da tela capturada limitada à qualidade escolhida
       const ratio = rawW && rawH ? rawW / rawH : 16 / 9;
       targetH = Math.min(cfg.height, rawH || cfg.height);
       targetW = Math.round(targetH * ratio);
@@ -245,14 +293,13 @@ export default function App() {
       if (videoEncoder.state !== 'closed') {
         videoEncoder.configure(bestCfg);
         forceKey = true;
-        addLog(`GPU Encoder ativo: ${targetW}x${targetH} @ ${targetFps} FPS (${currentCodecStr}, ${(cfg.bitrate/1e6).toFixed(1)} Mbps)`);
+        addLog(`GPU Encoder ativo: ${targetW}x${targetH} @ ${targetFps} FPS (${currentCodecStr})`);
       }
     };
 
     const settings = vTrack.getSettings ? vTrack.getSettings() : {};
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
-    // Captura de Áudio via WebCodecs Opus (se o usuário compartilhou áudio do jogo/aba)
     let audioEncoder = null;
     const aTrack = mediaStream.getAudioTracks()[0];
     if (aTrack && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window) {
@@ -285,7 +332,6 @@ export default function App() {
       } catch (e) {}
     }
 
-    // Leitura de Frames de Vídeo a 60 FPS Nativos via MediaStreamTrackProcessor (Imune a Alt+Tab throttling!)
     if ('MediaStreamTrackProcessor' in window) {
       const processor = new MediaStreamTrackProcessor({ track: vTrack });
       const reader = processor.readable.getReader();
@@ -298,8 +344,6 @@ export default function App() {
 
           const now = performance.now();
           const minInterval = 1000 / (Number(fpsRef.current) + 2);
-
-          // Controle de Backpressure: se a rede do transmissor oscilar, descarta ANTES do encoder para nunca quebrar os P-frames nem gerar atraso!
           const ws = socketRef.current?.io?.engine?.transport?.ws;
           const netBusy = ws && ws.bufferedAmount > 450000;
 
@@ -357,6 +401,11 @@ export default function App() {
         }
       });
 
+      // Se a opção "Mutar Discord ao compartilhar" estiver ativa (padrão), silencia o Discord.exe no Windows imediatamente
+      if (muteDiscordOnShare) {
+        setWindowsDiscordMute(true);
+      }
+
       const vTrack = mediaStream.getVideoTracks()[0];
       if (vTrack && 'contentHint' in vTrack) {
         vTrack.contentHint = 'motion';
@@ -386,7 +435,7 @@ export default function App() {
         fps: targetFps
       });
 
-      await startWebCodecsSender(newId, mediaStream, newStreamObj.type);
+      await startWebCodecsSender(newId, mediaStream);
     } catch (err) {
       addLog(`Compartilhamento cancelado: ${err.message}`);
     }
@@ -423,7 +472,7 @@ export default function App() {
         fps: Number(fps)
       });
 
-      await startWebCodecsSender(newId, mediaStream, 'Câmera');
+      await startWebCodecsSender(newId, mediaStream);
     } catch (err) {
       alert('Não foi possível acessar a webcam.');
     }
@@ -436,11 +485,28 @@ export default function App() {
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
       if (target?.stream) target.stream.getTracks().forEach(t => t.stop());
-      return prev.filter(s => s.id !== streamId);
+      const remaining = prev.filter(s => s.id !== streamId);
+
+      // Se parou de compartilhar a tela, restaura o som do Discord automaticamente
+      const stillSharingScreen = remaining.some(s => s.isLocal && s.type !== 'Câmera');
+      if (!stillSharingScreen) {
+        setWindowsDiscordMute(false);
+      }
+      return remaining;
     });
 
     socketRef.current?.emit('stop-stream', { streamId });
     if (expandedId === streamId) setExpandedId(null);
+  };
+
+  const triggerAppDownload = () => {
+    setShowDownloadModal(true);
+    const a = document.createElement('a');
+    a.href = '/api/download-app';
+    a.download = 'Telinha-Vogels-Windows.zip';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   const saveClip30s = (streamId, owner, openReplay = false) => {
@@ -460,7 +526,7 @@ export default function App() {
     }
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Telinha_Clip_${owner}_${Date.now()}.${ext}`;
+    a.download = `TelinhaVogels_Clip_${owner}_${Date.now()}.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -483,9 +549,13 @@ export default function App() {
     return (
       <div className="h-screen w-screen bg-[#0D0F13] flex items-center justify-center p-4">
         <div className="w-full max-w-sm bg-[#151922] border border-[#232936] rounded-xl p-6 shadow-2xl">
-          <div className="flex items-center gap-2 mb-6">
-            <span className="text-xl font-bold tracking-tight text-white">telinha</span>
-            <span className="text-[11px] bg-[#1E2433] text-indigo-400 px-2 py-0.5 rounded font-medium">v1.13.4</span>
+          <div className="flex items-center justify-between mb-6">
+            <span className="text-xl font-bold tracking-tight text-white">telinha vogels</span>
+            {desktopBridgeActive && (
+              <span className="text-[11px] bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 px-2 py-0.5 rounded font-medium">
+                App Windows Ativo
+              </span>
+            )}
           </div>
           <form
             onSubmit={(e) => {
@@ -533,11 +603,16 @@ export default function App() {
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
       <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20">
         <div className="flex items-center gap-2">
-          <span className="font-bold text-white text-sm tracking-tight">telinha</span>
+          <span className="font-bold text-white text-sm tracking-tight">telinha vogels</span>
           <span className="text-amber-400 text-xs">🔒</span>
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-300 px-2 py-0.5 rounded-full">
             {participants.length} online
           </span>
+          {discordCurrentlyMuted && (
+            <span className="bg-indigo-950/70 border border-indigo-700/60 text-[11px] text-indigo-300 px-2 py-0.5 rounded-full">
+              🔇 Discord Mutado
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -585,6 +660,22 @@ export default function App() {
                   <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
                 </div>
 
+                {/* Opção ativada por padrão para mutar o Discord ao compartilhar tela */}
+                <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-white">Mutar Discord ao compartilhar</span>
+                    <input
+                      type="checkbox"
+                      checked={muteDiscordOnShare}
+                      onChange={e => setMuteDiscordOnShare(e.target.checked)}
+                      className="w-4 h-4 accent-indigo-500 cursor-pointer"
+                    />
+                  </div>
+                  <p className="text-[11px] text-gray-400 mt-1 leading-snug">
+                    Vem ativado por padrão no App Windows: silencia o aplicativo Discord por completo enquanto você compartilha a tela para evitar duplicação de vozes.
+                  </p>
+                </div>
+
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (WebCodecs GPU)</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
@@ -610,7 +701,14 @@ export default function App() {
             📋 Logs
           </button>
 
-          <button onClick={copyRoomLink} className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer">
+          <button
+            onClick={triggerAppDownload}
+            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer"
+          >
+            Baixar app
+          </button>
+
+          <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
             🔗 Link
           </button>
 
@@ -666,6 +764,10 @@ export default function App() {
               ))}
             </div>
           )}
+
+          <div className="absolute bottom-1.5 left-3 text-[10px] text-gray-600 pointer-events-none">
+            telinha vogels
+          </div>
         </main>
 
         <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0">
@@ -716,11 +818,49 @@ export default function App() {
         </aside>
       </div>
 
+      {/* MODAL DE DOWNLOAD DO EXECUTÁVEL WINDOWS */}
+      {showDownloadModal && (
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
+          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-md p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[#222834] pb-2.5">
+              <h4 className="text-sm font-bold text-white">🖥️ Telinha Vogels — App Windows</h4>
+              <button onClick={() => setShowDownloadModal(false)} className="text-xs text-gray-400 hover:text-white px-2 py-0.5 rounded bg-[#1C212C]">✕</button>
+            </div>
+            <div className="text-xs text-gray-300 space-y-2.5 leading-relaxed">
+              <p>
+                O download de <b className="text-white">Telinha-Vogels-Windows.zip</b> foi iniciado!
+              </p>
+              <div className="bg-[#0D1016] border border-[#1E232E] rounded-lg p-3 space-y-1.5 text-[11px]">
+                <p className="text-indigo-300 font-semibold">Como abrir sem alerta do Windows:</p>
+                <p>1. Extraia o arquivo <b>Telinha-Vogels-Windows.zip</b>.</p>
+                <p>2. Dê dois cliques em <b>Instalar e Abrir Telinha Vogels.cmd</b>.</p>
+                <p>3. Ele criará o executável nativo <b>TelinhaVogels.exe</b> e o atalho na sua Área de Trabalho com a função de <b>Mutar o Discord automaticamente</b> ao compartilhar a tela.</p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <a
+                href="/api/download-app"
+                download="Telinha-Vogels-Windows.zip"
+                className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-lg px-4 py-2"
+              >
+                Baixar novamente (.ZIP)
+              </a>
+              <button
+                onClick={() => setShowDownloadModal(false)}
+                className="bg-[#1C212E] hover:bg-[#252C3D] text-gray-200 text-xs rounded-lg px-4 py-2 cursor-pointer"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showLogs && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">Logs GPU WebCodecs</h4>
+              <h4 className="text-sm font-semibold">Logs telinha vogels</h4>
               <button onClick={() => setShowLogs(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="bg-[#0B0D11] border border-[#1E232E] rounded-lg p-3 h-64 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1">
@@ -767,7 +907,6 @@ function VideoTile({
   const remoteAudioRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
 
-  // Se for transmissão LOCAL, exibe direto o <video> local e inicia o buffer circular de 30s (sem áudio)
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
     localVideoRef.current.srcObject = streamObj.stream;
@@ -794,7 +933,6 @@ function VideoTile({
     }
   }, [streamObj.isLocal, streamObj.stream]);
 
-  // Se for transmissão REMOTA, decodifica os pacotes binários H.264/VP8 direto na GPU via VideoDecoder -> Canvas!
   useEffect(() => {
     if (streamObj.isLocal) return;
 
@@ -868,7 +1006,6 @@ function VideoTile({
       }
     };
 
-    // Decodificador de Áudio Opus Remoto
     let audioDecoder = null;
     if ('AudioDecoder' in window && 'MediaStreamTrackGenerator' in window) {
       try {
@@ -902,7 +1039,6 @@ function VideoTile({
       } catch (e) {}
     }
 
-    // Inicia buffer de Clipe de 30s (sem áudio) direto do Canvas GPU remoto
     if (clipConfig !== 'off' && canvas.captureStream) {
       setTimeout(() => {
         try {
@@ -924,7 +1060,6 @@ function VideoTile({
       }, 1500);
     }
 
-    // Pede um Keyframe imediatamente ao montar o componente
     socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
 
     const statTimer = setInterval(() => {
