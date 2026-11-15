@@ -79,16 +79,13 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showMixer, setShowMixer] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
-  const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
-  // Volume de envio da própria transmissão (0% a 100%, padrão 70% para não chegar estourado para os amigos)
   const [outgoingVolume, setOutgoingVolume] = useState(() => {
     const saved = localStorage.getItem('tv_out_vol');
     return saved !== null ? Number(saved) : 70;
   });
 
-  // Volume mestre de recepção (0% a 100%)
   const [masterVolume, setMasterVolume] = useState(() => {
     const saved = localStorage.getItem('tv_master_vol');
     return saved !== null ? Number(saved) : 80;
@@ -120,6 +117,8 @@ export default function App() {
   const audioChunkHandlersRef = useRef({});
   const clipRecordersRef = useRef({});
   const clipChunksRef = useRef({});
+  // Guarda quais streams o usuário clicou em "Parar de assistir" para não reabrir sozinho quando chegar pacote
+  const stoppedWatchingSetRef = useRef(new Set());
 
   const qualityRef = useRef(quality);
   const fpsRef = useRef(fps);
@@ -200,6 +199,38 @@ export default function App() {
     );
   };
 
+  // Alterna entre "Assistir" e "Parar de assistir" instantaneamente sem precisar de F5!
+  const setWatchingStream = (streamId, shouldWatch) => {
+    if (shouldWatch) {
+      stoppedWatchingSetRef.current.delete(streamId);
+    } else {
+      stoppedWatchingSetRef.current.add(streamId);
+      if (expandedId === streamId) setExpandedId(null);
+      delete videoChunkHandlersRef.current[streamId];
+      delete audioChunkHandlersRef.current[streamId];
+    }
+
+    setStreams(prev =>
+      prev.map(s => {
+        if (s.id !== streamId) return s;
+        return {
+          ...s,
+          watching: shouldWatch,
+          minimized: false,
+          // Incrementa watchSession para remontar o VideoDecoder do zero quando clicar em Assistir
+          watchSession: (s.watchSession || 0) + 1
+        };
+      })
+    );
+
+    if (shouldWatch) {
+      socketRef.current?.emit('request-keyframe', { streamId });
+      addLog(`Assistindo transmissão [${streamId}]...`);
+    } else {
+      addLog(`Parou de assistir transmissão [${streamId}].`);
+    }
+  };
+
   const handlePasteRoomLink = async () => {
     try {
       const text = await navigator.clipboard.readText();
@@ -239,12 +270,63 @@ export default function App() {
     socket.on('room-users', (list) => setParticipants(list));
 
     socket.on('active-streams', (list) => {
-      list.forEach(st => {
-        if (st.senderId === socket.id) return;
-        setStreams(prev => prev.some(s => s.id === st.streamId) ? prev : [
+      setStreams(prev => {
+        const localOnes = prev.filter(s => s.isLocal);
+        const updatedRemotes = [];
+
+        list.forEach(st => {
+          if (st.senderId === socket.id) return;
+          const existing = prev.find(p => p.id === st.streamId);
+          if (existing) {
+            updatedRemotes.push({
+              ...existing,
+              senderId: st.senderId,
+              owner: st.owner,
+              res: st.res,
+              fps: st.fps
+            });
+          } else {
+            const isStopped = stoppedWatchingSetRef.current.has(st.streamId);
+            updatedRemotes.push({
+              id: st.streamId,
+              senderId: st.senderId,
+              owner: st.owner,
+              type: st.type,
+              res: st.res,
+              fps: st.fps,
+              volume: 75,
+              muted: false,
+              minimized: false,
+              watching: !isStopped,
+              watchSession: 1,
+              isLocal: false
+            });
+          }
+        });
+
+        return [...localOnes, ...updatedRemotes];
+      });
+    });
+
+    socket.on('stream-started', (st) => {
+      if (st.senderId === socket.id) return;
+      addLog(`${st.owner} iniciou transmissão (${st.res} @ ${st.fps} FPS)`);
+      stoppedWatchingSetRef.current.delete(st.streamId);
+
+      setStreams(prev => {
+        const exists = prev.find(s => s.id === st.streamId);
+        if (exists) {
+          return prev.map(s =>
+            s.id === st.streamId
+              ? { ...s, senderId: st.senderId, watching: true, minimized: false, watchSession: (s.watchSession || 0) + 1 }
+              : s
+          );
+        }
+        return [
           ...prev,
           {
             id: st.streamId,
+            senderId: st.senderId,
             owner: st.owner,
             type: st.type,
             res: st.res,
@@ -252,29 +334,12 @@ export default function App() {
             volume: 75,
             muted: false,
             minimized: false,
+            watching: true,
+            watchSession: 1,
             isLocal: false
           }
-        ]);
+        ];
       });
-    });
-
-    socket.on('stream-started', (st) => {
-      if (st.senderId === socket.id) return;
-      addLog(`${st.owner} iniciou transmissão (${st.res} @ ${st.fps} FPS)`);
-      setStreams(prev => prev.some(s => s.id === st.streamId) ? prev : [
-        ...prev,
-        {
-          id: st.streamId,
-          owner: st.owner,
-          type: st.type,
-          res: st.res,
-          fps: st.fps,
-          volume: 75,
-          muted: false,
-          minimized: false,
-          isLocal: false
-        }
-      ]);
       socket.emit('request-keyframe', { streamId: st.streamId });
     });
 
@@ -283,12 +348,15 @@ export default function App() {
     });
 
     socket.on('v-chunk', (meta, buffer) => {
+      // Se o stream ainda não estava registrado na lista local, registra respeitando se o usuário parou de assistir
       setStreams(prev => {
         if (prev.some(s => s.id === meta.id)) return prev;
+        const isStopped = stoppedWatchingSetRef.current.has(meta.id);
         return [
           ...prev,
           {
             id: meta.id,
+            senderId: meta.senderId,
             owner: meta.owner || 'Participante',
             type: 'Tela',
             res: `${meta.h}p`,
@@ -296,20 +364,26 @@ export default function App() {
             volume: 75,
             muted: false,
             minimized: false,
+            watching: !isStopped,
+            watchSession: 1,
             isLocal: false
           }
         ];
       });
+
+      if (stoppedWatchingSetRef.current.has(meta.id)) return;
       const handler = videoChunkHandlersRef.current[meta.id];
       if (handler) handler(meta, buffer);
     });
 
     socket.on('a-chunk', (meta, buffer) => {
+      if (stoppedWatchingSetRef.current.has(meta.id)) return;
       const handler = audioChunkHandlersRef.current[meta.id];
       if (handler) handler(meta, buffer);
     });
 
     socket.on('peer-stopped-stream', ({ streamId }) => {
+      stoppedWatchingSetRef.current.delete(streamId);
       setStreams(prev => prev.filter(s => s.id !== streamId));
       delete videoChunkHandlersRef.current[streamId];
       delete audioChunkHandlersRef.current[streamId];
@@ -498,7 +572,7 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              const isKey = forceKey || (frameCount % 90 === 0);
+              const isKey = forceKey || (frameCount % 60 === 0);
               forceKey = false;
               videoEncoder.encode(frame, { keyFrame: isKey });
               frameCount++;
@@ -556,6 +630,7 @@ export default function App() {
 
       const newStreamObj = {
         id: newId,
+        senderId: socketRef.current?.id,
         owner: nickname,
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
@@ -564,6 +639,8 @@ export default function App() {
         volume: 100,
         muted: true,
         minimized: false,
+        watching: true,
+        watchSession: 1,
         isLocal: true
       };
 
@@ -594,6 +671,7 @@ export default function App() {
 
       const newStreamObj = {
         id: newId,
+        senderId: socketRef.current?.id,
         owner: nickname,
         type: 'Câmera',
         stream: mediaStream,
@@ -602,6 +680,8 @@ export default function App() {
         volume: 100,
         muted: true,
         minimized: false,
+        watching: true,
+        watchSession: 1,
         isLocal: true
       };
 
@@ -634,16 +714,17 @@ export default function App() {
     if (expandedId === streamId) setExpandedId(null);
   };
 
+  // Faz o download direto do executável único VogelsTV.exe (sem .zip)
   const triggerAppDownload = () => {
-    setShowDownloadModal(true);
     const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
     const dlUrl = `/api/download-app?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
     const a = document.createElement('a');
     a.href = dlUrl;
-    a.download = 'VogelsTV-Windows.zip';
+    a.download = 'VogelsTV.exe';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    addLog('Download do executável VogelsTV.exe iniciado.');
   };
 
   const saveClip30s = (streamId, owner, openReplay = false) => {
@@ -759,8 +840,9 @@ export default function App() {
     );
   }
 
-  const activeStreams = streams.filter(s => !s.minimized);
-  const minimizedStreams = streams.filter(s => s.minimized);
+  const watchingStreams = streams.filter(s => s.watching !== false && !s.minimized);
+  const unwatchedStreams = streams.filter(s => !s.isLocal && s.watching === false);
+  const minimizedStreams = streams.filter(s => s.watching !== false && s.minimized);
   const remoteStreams = streams.filter(s => !s.isLocal);
   const { cleanRoom } = parseRoomInput(roomName, roomPassword);
 
@@ -800,7 +882,6 @@ export default function App() {
             <option value={60}>60 fps</option>
           </select>
 
-          {/* BOTÃO DO MIXER DE ÁUDIO (0% a 100%) */}
           <div className="relative">
             <button
               onClick={() => {
@@ -810,7 +891,6 @@ export default function App() {
               className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer ${
                 showMixer ? 'bg-red-600/30 border-red-500 text-white' : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
               }`}
-              title="Mixer de Volume (0% a 100%)"
             >
               <span>🎚️</span> Mixer
             </button>
@@ -822,7 +902,6 @@ export default function App() {
                   <button onClick={() => setShowMixer(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
                 </div>
 
-                {/* Volume Mestre de Recepção */}
                 <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3 space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-medium text-white">🔊 Volume Geral (Pra Você)</span>
@@ -836,12 +915,8 @@ export default function App() {
                     onChange={e => setMasterVolume(Number(e.target.value))}
                     className="w-full accent-red-500 cursor-pointer"
                   />
-                  <p className="text-[10px] text-gray-400">
-                    Regula o volume de todas as lives que você está assistindo.
-                  </p>
                 </div>
 
-                {/* Volume de Envio da sua Live */}
                 <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3 space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-medium text-white">🎙️ Volume da Sua Live (Envio)</span>
@@ -855,12 +930,8 @@ export default function App() {
                     onChange={e => setOutgoingVolume(Number(e.target.value))}
                     className="w-full accent-indigo-500 cursor-pointer"
                   />
-                  <p className="text-[10px] text-gray-400">
-                    Se o som do seu jogo estiver alto demais para seus amigos, abaixe aqui sem alterar o volume do seu Windows.
-                  </p>
                 </div>
 
-                {/* Sliders Individuais de cada Amigo Transmitindo */}
                 <div className="space-y-2">
                   <span className="block text-[11px] font-semibold uppercase tracking-wider text-gray-400">
                     Transmissões na Sala
@@ -977,6 +1048,7 @@ export default function App() {
           <button
             onClick={triggerAppDownload}
             className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer"
+            title="Baixar executável VogelsTV.exe direto"
           >
             Baixar app
           </button>
@@ -993,20 +1065,41 @@ export default function App() {
 
       <div className="flex-1 flex overflow-hidden">
         <main className="flex-1 bg-[#0B0D11] relative flex flex-col p-3 overflow-hidden">
-          {activeStreams.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center">
-              <p className="text-xs text-gray-400">Ninguém está compartilhando ainda.</p>
-              <p className="text-xs text-gray-400 mt-0.5">
-                Clique em <button onClick={handleShareScreen} className="text-gray-200 font-semibold hover:underline cursor-pointer">Compartilhar tela</button> para começar.
-              </p>
+          {watchingStreams.length === 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3">
+              {unwatchedStreams.length > 0 ? (
+                <>
+                  <p className="text-xs text-gray-300">
+                    Há {unwatchedStreams.length} transmissão(ões) ativa(s) na sala que você parou de assistir.
+                  </p>
+                  <div className="flex flex-wrap gap-2 justify-center">
+                    {unwatchedStreams.map(us => (
+                      <button
+                        key={us.id}
+                        onClick={() => setWatchingStream(us.id, true)}
+                        className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3.5 py-2 rounded-lg cursor-pointer shadow"
+                      >
+                        ▶️ Assistir {us.owner} ({us.res})
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div>
+                  <p className="text-xs text-gray-400">Ninguém está compartilhando ainda.</p>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    Clique em <button onClick={handleShareScreen} className="text-gray-200 font-semibold hover:underline cursor-pointer">Compartilhar tela</button> para começar.
+                  </p>
+                </div>
+              )}
             </div>
           ) : (
-            <div className={`flex-1 grid gap-3 overflow-hidden ${expandedId || activeStreams.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
-              {activeStreams
+            <div className={`flex-1 grid gap-3 overflow-hidden ${expandedId || watchingStreams.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
+              {watchingStreams
                 .filter(s => !expandedId || s.id === expandedId)
                 .map(streamObj => (
                   <VideoTile
-                    key={streamObj.id}
+                    key={`${streamObj.id}_${streamObj.watchSession || 1}`}
                     streamObj={streamObj}
                     masterVolume={masterVolume}
                     socketRef={socketRef}
@@ -1017,6 +1110,7 @@ export default function App() {
                     clipConfig={clipConfig}
                     clipDuration={clipDuration}
                     onStop={() => stopStream(streamObj.id)}
+                    onStopWatching={() => setWatchingStream(streamObj.id, false)}
                     onMute={() => toggleStreamMute(streamObj.id)}
                     onVolumeChange={(val) => setStreamVolume(streamObj.id, val)}
                     onMinimize={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s))}
@@ -1049,17 +1143,65 @@ export default function App() {
           <div className="p-3 border-b border-[#1E232E]">
             <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2">PARTICIPANTES</h3>
             <div className="space-y-1.5">
-              {participants.map(p => (
-                <div key={p.id} className="flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                    <span className="text-gray-200 font-medium">
-                      {p.nick} {p.id === socketRef.current?.id && <span className="text-gray-400">(você)</span>}
-                    </span>
+              {participants.map(p => {
+                const isMe = p.id === socketRef.current?.id;
+                const userStreams = streams.filter(
+                  s => (s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)
+                );
+                const hasActiveStream = userStreams.length > 0;
+                const isCurrentlyWatching = userStreams.some(s => s.watching !== false);
+
+                return (
+                  <div key={p.id} className="flex items-center justify-between text-xs gap-1">
+                    <div className="flex items-center gap-2 truncate">
+                      <span className={`w-2 h-2 rounded-full shrink-0 ${hasActiveStream ? 'bg-red-500 animate-pulse' : 'bg-emerald-400'}`}></span>
+                      <span className="text-gray-200 font-medium truncate">
+                        {p.nick} {isMe && <span className="text-gray-400">(você)</span>}
+                      </span>
+                    </div>
+
+                    {/* No local onde ficava GPU Stream: botão Assistir / Parar de assistir */}
+                    {isMe ? (
+                      hasActiveStream ? (
+                        <button
+                          onClick={() => userStreams.forEach(s => stopStream(s.id))}
+                          className="text-[10px] bg-red-950/70 hover:bg-red-900 border border-red-700/60 text-red-200 px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
+                        >
+                          Parar live
+                        </button>
+                      ) : (
+                        <span className="text-[10px] text-gray-500 bg-[#181C26] px-2 py-0.5 rounded shrink-0">
+                          Online
+                        </span>
+                      )
+                    ) : hasActiveStream ? (
+                      isCurrentlyWatching ? (
+                        <button
+                          onClick={() => userStreams.forEach(s => setWatchingStream(s.id, false))}
+                          className="text-[10px] bg-red-600/25 hover:bg-red-600/40 border border-red-500/50 text-red-300 font-medium px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
+                        >
+                          Parar de assistir
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => userStreams.forEach(s => setWatchingStream(s.id, true))}
+                          className="text-[10px] bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/60 text-emerald-300 font-semibold px-2.5 py-0.5 rounded cursor-pointer shrink-0 transition"
+                        >
+                          Assistir
+                        </button>
+                      )
+                    ) : (
+                      <button
+                        onClick={() => socketRef.current?.emit('request-active-streams')}
+                        className="text-[10px] text-gray-400 hover:text-white bg-[#181C26] hover:bg-[#222836] border border-[#262C3A] px-2 py-0.5 rounded cursor-pointer shrink-0 transition"
+                        title="Verificar ou assistir transmissão deste participante"
+                      >
+                        Assistir
+                      </button>
+                    )}
                   </div>
-                  <span className="text-[10px] text-emerald-400/80 bg-emerald-950/40 px-1.5 py-0.5 rounded">{p.conn}</span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 
@@ -1092,38 +1234,6 @@ export default function App() {
           </div>
         </aside>
       </div>
-
-      {showDownloadModal && (
-        <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
-          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-md p-5 space-y-4 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-[#222834] pb-2.5">
-              <h4 className="text-sm font-bold text-white flex items-center gap-1.5">
-                🖥️ <VogelsLogo size="text-sm" /> — App Windows
-              </h4>
-              <button onClick={() => setShowDownloadModal(false)} className="text-xs text-gray-400 hover:text-white px-2 py-0.5 rounded bg-[#1C212C]">✕</button>
-            </div>
-            <div className="text-xs text-gray-300 space-y-2.5 leading-relaxed">
-              <p>
-                O download de <b className="text-white">VogelsTV-Windows.zip</b> vinculado à sala <b className="text-red-400">{cleanRoom}</b> foi iniciado!
-              </p>
-              <div className="bg-[#0D1016] border border-[#1E232E] rounded-lg p-3 space-y-1.5 text-[11px]">
-                <p className="text-red-400 font-semibold">Como usar:</p>
-                <p>1. Extraia o arquivo <b>VogelsTV-Windows.zip</b>.</p>
-                <p>2. Dê dois cliques em <b>Instalar e Abrir VogelsTV.cmd</b>.</p>
-                <p>3. Ele abrirá sincronizado na mesma sala do navegador com isolamento da voz do Discord.</p>
-              </div>
-            </div>
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setShowDownloadModal(false)}
-                className="bg-[#1C212E] hover:bg-[#252C3D] text-gray-200 text-xs rounded-lg px-4 py-2 cursor-pointer"
-              >
-                Fechar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {showLogs && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
@@ -1165,6 +1275,7 @@ function VideoTile({
   clipConfig,
   clipDuration,
   onStop,
+  onStopWatching,
   onMute,
   onVolumeChange,
   onMinimize,
@@ -1182,7 +1293,6 @@ function VideoTile({
   const volumeRef = useRef(streamObj.volume ?? 75);
   const masterVolRef = useRef(masterVolume ?? 80);
 
-  // Atualiza o GainNode imediatamente quando o usuário mexe na barra de 0% a 100%
   useEffect(() => {
     mutedRef.current = streamObj.muted;
     volumeRef.current = streamObj.volume ?? 75;
@@ -1295,7 +1405,6 @@ function VideoTile({
       }
     };
 
-    // Pipeline de Áudio com GainNode + Limiter suave para NUNCA estourar o áudio
     let audioCtx = null;
     let audioDecoder = null;
     let nextPlayTime = 0;
@@ -1307,7 +1416,6 @@ function VideoTile({
         const gainNode = audioCtx.createGain();
         gainNode.gain.value = mutedRef.current ? 0 : (volumeRef.current / 100) * (masterVolRef.current / 100);
 
-        // Compressor/Limiter de proteção contra áudio estourado
         const compressor = audioCtx.createDynamicsCompressor();
         compressor.threshold.value = -12;
         compressor.knee.value = 18;
@@ -1406,7 +1514,13 @@ function VideoTile({
       }, 1500);
     }
 
+    // Pede keyframe imediatamente e repete a cada 400ms enquanto aguarda o 1º quadro (garante reabertura sem F5!)
     socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+    const keyframeRetryTimer = setInterval(() => {
+      if (waitingForKey) {
+        socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+      }
+    }, 400);
 
     const statTimer = setInterval(() => {
       const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
@@ -1416,6 +1530,7 @@ function VideoTile({
     }, 1000);
 
     return () => {
+      clearInterval(keyframeRetryTimer);
       clearInterval(statTimer);
       delete videoChunkHandlersRef.current[streamObj.id];
       delete audioChunkHandlersRef.current[streamObj.id];
@@ -1484,8 +1599,15 @@ function VideoTile({
         <button onClick={onExpand} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
           {isExpanded ? '🗗 Restaurar' : '⛶ Expandir'}
         </button>
+        {!streamObj.isLocal && (
+          <button onClick={onStopWatching} className="bg-red-600/80 hover:bg-red-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">
+            Parar de assistir
+          </button>
+        )}
         {streamObj.isLocal && (
-          <button onClick={onStop} className="bg-red-600/80 hover:bg-red-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">Parar</button>
+          <button onClick={onStop} className="bg-red-600/80 hover:bg-red-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">
+            Parar
+          </button>
         )}
       </div>
     </div>
