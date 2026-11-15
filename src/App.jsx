@@ -1,11 +1,31 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
+// Servidor central unificado: garante que quem abrir pelo App Desktop, por tela-14lf ou por telinha-platform caia SEMPRE na mesma sala!
+const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
+
 const RES_CONFIG = {
   '720p': { width: 1280, height: 720, bitrate: 3500000, label: '720p' },
   '1080p': { width: 1920, height: 1080, bitrate: 6000000, label: '1080p' },
   '1440p': { width: 2560, height: 1440, bitrate: 9000000, label: '2K (1440p)' }
 };
+
+function parseRoomInput(rawRoom, rawPass) {
+  let r = String(rawRoom || '').trim();
+  let p = String(rawPass || '').trim();
+
+  if (r.startsWith('http://') || r.startsWith('https://') || r.includes('?sala=')) {
+    try {
+      const u = new URL(r.startsWith('http') ? r : `https://telinha.local/${r}`);
+      if (u.searchParams.get('sala')) r = u.searchParams.get('sala');
+      if (u.searchParams.get('senha') && !p) p = u.searchParams.get('senha');
+    } catch (e) {}
+  }
+  return {
+    cleanRoom: r.toLowerCase().replace(/\s+/g, '-').slice(0, 40) || 'squad-brasil',
+    cleanPass: p.toLowerCase().slice(0, 30)
+  };
+}
 
 async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
   const w = Math.max(2, Math.floor(width / 2) * 2);
@@ -42,6 +62,7 @@ export default function App() {
   const [inRoom, setInRoom] = useState(false);
   const [nickname, setNickname] = useState(() => localStorage.getItem('tv_nick') || 'gosadinhas');
   const [roomName, setRoomName] = useState('squad-brasil');
+  const [roomPassword, setRoomPassword] = useState('');
 
   const [quality, setQuality] = useState('1080p');
   const [sharpness, setSharpness] = useState('motion');
@@ -52,7 +73,6 @@ export default function App() {
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
-  // Opção ATIVADA POR PADRÃO: Exclui o áudio do Discord da transmissão (sem mutar no fone de quem streama!)
   const [excludeDiscordAudio, setExcludeDiscordAudio] = useState(() => {
     const saved = localStorage.getItem('tv_exclude_discord');
     return saved !== null ? saved === 'true' : true;
@@ -90,6 +110,7 @@ export default function App() {
     setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
   };
 
+  // Detecta continuamente a ponte WASAPI do App Windows (funciona tanto na janela do App quanto no navegador!)
   useEffect(() => {
     const checkBridge = async () => {
       try {
@@ -97,11 +118,12 @@ export default function App() {
         const data = await res.json();
         if (data?.ok) {
           setDesktopBridgeActive(true);
-          addLog('App Desktop Windows detectado: Captura WASAPI Anti-Eco do Discord pronta.');
         }
       } catch (e) {}
     };
     checkBridge();
+    const timer = setInterval(checkBridge, 4000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -119,21 +141,49 @@ export default function App() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('sala')) setRoomName(params.get('sala'));
+    if (params.get('senha')) setRoomPassword(params.get('senha'));
   }, []);
 
   useEffect(() => {
     localStorage.setItem('tv_nick', nickname);
   }, [nickname]);
 
+  const handlePasteRoomLink = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) return;
+      const { cleanRoom, cleanPass } = parseRoomInput(text, roomPassword);
+      setRoomName(cleanRoom);
+      if (cleanPass) setRoomPassword(cleanPass);
+      addLog(`Link colado: Sala "${cleanRoom}"`);
+    } catch (e) {
+      alert('Cole o link diretamente no campo "Nome da sala" (Ctrl+V).');
+    }
+  };
+
   useEffect(() => {
     if (!inRoom) return;
 
-    const socket = io({ transports: ['websocket'] });
+    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
+
+    // Conecta sempre ao servidor central para evitar conflito entre URLs diferentes ou App vs Navegador
+    const targetServer = window.location.hostname.includes('onrender.com')
+      ? MASTER_RENDER_URL
+      : window.location.origin;
+
+    const socket = io(targetServer, {
+      transports: ['websocket', 'polling'],
+      reconnection: true
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      addLog(`Conectado ao servidor telinha vogels (ID: ${socket.id})`);
-      socket.emit('join-room', { roomName, nickname });
+      addLog(`Conectado na sala [${cleanRoom}] em ${targetServer}`);
+      socket.emit('join-room', {
+        roomName: cleanRoom,
+        roomPassword: cleanPass,
+        nickname
+      });
     });
 
     socket.on('room-users', (list) => setParticipants(list));
@@ -220,7 +270,7 @@ export default function App() {
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
       socket.disconnect();
     };
-  }, [inRoom, roomName, nickname]);
+  }, [inRoom, roomName, roomPassword, nickname]);
 
   const startWebCodecsSender = async (streamId, mediaStream, isCamera = false) => {
     const vTrack = mediaStream.getVideoTracks()[0];
@@ -276,9 +326,6 @@ export default function App() {
     const settings = vTrack.getSettings ? vTrack.getSettings() : {};
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
-    // PIPELINE DE ÁUDIO:
-    // 1. Se estiver no App Desktop Windows, captura o áudio WASAPI com EXCLUSÃO DO DISCORD (você ouve o Discord normal, mas a live não ouve!)
-    // 2. Se estiver apenas no navegador comum, usa a trilha de áudio padrão do navegador.
     let audioEncoder = null;
     if (!isCamera && 'AudioEncoder' in window) {
       try {
@@ -310,16 +357,15 @@ export default function App() {
               setDiscordIsolatedActive(excludeDiscordRef.current);
               addLog(
                 excludeDiscordRef.current
-                  ? 'Áudio WASAPI Ativo: Transmitindo som do PC/Jogo SEM a voz do Discord (você continua ouvindo o Discord normalmente).'
+                  ? 'Áudio WASAPI Ativo: Transmitindo som do PC/Jogo SEM a voz do Discord.'
                   : 'Áudio WASAPI Ativo: Transmitindo todo o som do PC.'
               );
 
-              // Desativa a trilha bruta do navegador para não misturar com o stream limpo do WASAPI
               mediaStream.getAudioTracks().forEach(t => { t.enabled = false; t.stop(); });
 
               const reader = response.body.getReader();
               let leftover = new Uint8Array(0);
-              const frameBytes = 960 * 4; // 20ms @ 48kHz stereo 16-bit PCM = 3840 bytes
+              const frameBytes = 960 * 4;
               let timestampUs = 0;
 
               (async () => {
@@ -357,7 +403,6 @@ export default function App() {
           } catch (e) {}
         }
 
-        // Fallback caso a pessoa esteja transmitindo pelo navegador sem o App Desktop instalado
         if (!usingDesktopWasapi) {
           const aTrack = mediaStream.getAudioTracks()[0];
           if (aTrack && 'MediaStreamTrackProcessor' in window) {
@@ -535,8 +580,10 @@ export default function App() {
 
   const triggerAppDownload = () => {
     setShowDownloadModal(true);
+    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
+    const dlUrl = `/api/download-app?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
     const a = document.createElement('a');
-    a.href = '/api/download-app';
+    a.href = dlUrl;
     a.download = 'Telinha-Vogels-Windows.zip';
     document.body.appendChild(a);
     a.click();
@@ -574,9 +621,11 @@ export default function App() {
   };
 
   const copyRoomLink = () => {
-    const url = `${window.location.origin}/?sala=${encodeURIComponent(roomName)}`;
+    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
+    const base = window.location.hostname.includes('onrender.com') ? MASTER_RENDER_URL : window.location.origin;
+    const url = `${base}/?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
     navigator.clipboard.writeText(url);
-    alert(`Link copiado:\n${url}`);
+    alert(`Link da sala copiado:\n${url}`);
   };
 
   if (!inRoom) {
@@ -594,7 +643,10 @@ export default function App() {
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              if (nickname.trim() && roomName.trim()) setInRoom(true);
+              const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
+              setRoomName(cleanRoom);
+              if (cleanPass) setRoomPassword(cleanPass);
+              if (nickname.trim() && cleanRoom) setInRoom(true);
             }}
             className="space-y-4"
           >
@@ -605,16 +657,37 @@ export default function App() {
                 required
                 value={nickname}
                 onChange={e => setNickname(e.target.value)}
+                placeholder="Ex: gosadinhas"
                 className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500"
               />
             </div>
             <div>
-              <label className="block text-xs text-gray-400 mb-1.5 font-medium">Nome da sala</label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="block text-xs text-gray-400 font-medium">Nome da sala (ou cole o link)</label>
+                <button
+                  type="button"
+                  onClick={handlePasteRoomLink}
+                  className="text-[11px] text-indigo-400 hover:text-indigo-300 cursor-pointer"
+                >
+                  📋 Colar link da sala
+                </button>
+              </div>
               <input
                 type="text"
                 required
                 value={roomName}
                 onChange={e => setRoomName(e.target.value)}
+                placeholder="Ex: squad-brasil"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1.5 font-medium">Senha da sala (opcional)</label>
+              <input
+                type="text"
+                value={roomPassword}
+                onChange={e => setRoomPassword(e.target.value)}
+                placeholder="Deixe vazio se a sala não tiver senha"
                 className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500"
               />
             </div>
@@ -632,6 +705,7 @@ export default function App() {
 
   const activeStreams = streams.filter(s => !s.minimized);
   const minimizedStreams = streams.filter(s => s.minimized);
+  const { cleanRoom } = parseRoomInput(roomName, roomPassword);
 
   return (
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
@@ -639,11 +713,14 @@ export default function App() {
         <div className="flex items-center gap-2">
           <span className="font-bold text-white text-sm tracking-tight">telinha vogels</span>
           <span className="text-amber-400 text-xs">🔒</span>
+          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-indigo-300 px-2 py-0.5 rounded-full font-mono">
+            Sala: {cleanRoom}
+          </span>
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-300 px-2 py-0.5 rounded-full">
             {participants.length} online
           </span>
           {discordIsolatedActive && (
-            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full" title="Você escuta o Discord normalmente, mas a voz do Discord não sai na live">
+            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full">
               🛡️ Voz do Discord Isolada da Live
             </span>
           )}
@@ -694,7 +771,6 @@ export default function App() {
                   <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
                 </div>
 
-                {/* Opção ativada por padrão: Remove apenas da transmissão (não muta seu fone!) */}
                 <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-white">Remover sons do Discord na live</span>
@@ -706,7 +782,7 @@ export default function App() {
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Ativado por padrão no App Windows: você continua ouvindo seus amigos no Discord normalmente, mas a voz deles não sai na sua transmissão (evita eco para quem assiste na web ou no app).
+                    Ativado por padrão: você continua ouvindo seus amigos no Discord normalmente, mas a voz deles não sai na sua transmissão.
                   </p>
                 </div>
 
@@ -746,7 +822,7 @@ export default function App() {
             🔗 Link
           </button>
 
-          <button onClick={() => window.location.reload()} className="bg-[#171B24] hover:bg-red-950/60 border border-red-800/60 text-xs text-red-300 rounded-md px-2.5 py-1.5 cursor-pointer">
+          <button onClick={() => setInRoom(false)} className="bg-[#171B24] hover:bg-red-950/60 border border-red-800/60 text-xs text-red-300 rounded-md px-2.5 py-1.5 cursor-pointer">
             Sair
           </button>
         </div>
@@ -861,23 +937,16 @@ export default function App() {
             </div>
             <div className="text-xs text-gray-300 space-y-2.5 leading-relaxed">
               <p>
-                O download de <b className="text-white">Telinha-Vogels-Windows.zip</b> foi iniciado!
+                O download de <b className="text-white">Telinha-Vogels-Windows.zip</b> já vinculado à sala <b className="text-indigo-300">{cleanRoom}</b> foi iniciado!
               </p>
               <div className="bg-[#0D1016] border border-[#1E232E] rounded-lg p-3 space-y-1.5 text-[11px]">
-                <p className="text-indigo-300 font-semibold">Como instalar a captura seletiva (Sem Eco do Discord):</p>
+                <p className="text-indigo-300 font-semibold">Como usar:</p>
                 <p>1. Extraia o arquivo <b>Telinha-Vogels-Windows.zip</b>.</p>
                 <p>2. Dê dois cliques em <b>Instalar e Abrir Telinha Vogels.cmd</b>.</p>
-                <p>3. Ele compila o motor nativo <b>WASAPI Process Loopback Exclusion</b>: você escuta seus amigos no Discord normalmente, mas a voz deles é filtrada da sua live para quem assiste na web ou no app.</p>
+                <p>3. Ele já abrirá sincronizado no mesmo servidor e na mesma sala do navegador, além de habilitar o isolamento da voz do Discord tanto no App quanto no navegador.</p>
               </div>
             </div>
             <div className="flex justify-end gap-2 pt-1">
-              <a
-                href="/api/download-app"
-                download="Telinha-Vogels-Windows.zip"
-                className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-lg px-4 py-2"
-              >
-                Baixar novamente (.ZIP)
-              </a>
               <button
                 onClick={() => setShowDownloadModal(false)}
                 className="bg-[#1C212E] hover:bg-[#252C3D] text-gray-200 text-xs rounded-lg px-4 py-2 cursor-pointer"
@@ -1043,7 +1112,6 @@ function VideoTile({
       }
     };
 
-    // Reprodutor de Áudio Web Audio API (Funciona em qualquer navegador web para quem assiste!)
     let audioCtx = null;
     let audioDecoder = null;
     let nextPlayTime = 0;
@@ -1060,7 +1128,6 @@ function VideoTile({
                 const numCh = audioData.numberOfChannels || 2;
                 const audioBuffer = audioCtx.createBuffer(numCh, numFrames, audioData.sampleRate || 48000);
 
-                // Extrai os canais decodificados para o Web Audio API
                 const fmt = audioData.format || 'f32-planar';
                 if (fmt.includes('planar')) {
                   for (let c = 0; c < numCh; c++) {

@@ -87,12 +87,33 @@ function createZipBuffer(files) {
   return Buffer.concat([...localParts, ...centralParts, eocd]);
 }
 
-app.get('/api/download-app', (req, res) => {
-  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-  const appUrl = `${proto}://${req.get('host')}`;
+// Normaliza o nome da sala (mesmo se o usuário colar um link inteiro no campo de sala!)
+function normalizeRoomKey(rawRoom, rawPassword) {
+  let r = String(rawRoom || 'squad-brasil').trim();
+  let p = String(rawPassword || '').trim();
 
-  // Código C# Nativo com WASAPI PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-  // Captura todo o áudio do PC/Jogo EXCLUINDO o Discord.exe da transmissão (sem mutar o Discord para quem está jogando!)
+  if (r.startsWith('http://') || r.startsWith('https://') || r.includes('?sala=')) {
+    try {
+      const urlObj = new URL(r.startsWith('http') ? r : `https://telinha.local/${r}`);
+      if (urlObj.searchParams.get('sala')) r = urlObj.searchParams.get('sala');
+      if (urlObj.searchParams.get('senha') && !p) p = urlObj.searchParams.get('senha');
+    } catch (e) {}
+  }
+
+  const cleanRoom = r.toLowerCase().replace(/\s+/g, '-').slice(0, 40) || 'squad-brasil';
+  const cleanPass = p.toLowerCase().slice(0, 30);
+  return cleanPass ? `${cleanRoom}::pass:${cleanPass}` : cleanRoom;
+}
+
+app.get('/api/download-app', (req, res) => {
+  const rawProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  const host = req.get('host') || 'telinha-platform.onrender.com';
+  const baseUrl = `${rawProto}://${host}`;
+
+  const salaParam = req.query.sala ? `&sala=${encodeURIComponent(String(req.query.sala))}` : '';
+  const senhaParam = req.query.senha ? `&senha=${encodeURIComponent(String(req.query.senha))}` : '';
+  const targetUrl = `${baseUrl}/?desktop=1${salaParam}${senhaParam}`;
+
   const csharpSource = `
 using System;
 using System.Diagnostics;
@@ -161,7 +182,6 @@ namespace TelinhaVogelsDesktop {
         int GetMute([MarshalAs(UnmanagedType.Bool)] out bool pbMute);
     }
 
-    // Interfaces WASAPI Process Loopback (Windows 10 20H1+ / Windows 11)
     [ComImport, Guid("94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     internal interface IAgileObject { }
 
@@ -212,12 +232,12 @@ namespace TelinhaVogelsDesktop {
     [StructLayout(LayoutKind.Sequential)]
     internal struct AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
         public uint TargetProcessId;
-        public int ProcessLoopbackMode; // 0 = INCLUDE_TREE, 1 = EXCLUDE_TREE
+        public int ProcessLoopbackMode;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct AUDIOCLIENT_ACTIVATION_PARAMS {
-        public int ActivationType; // 1 = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+        public int ActivationType;
         public AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
     }
 
@@ -263,7 +283,6 @@ namespace TelinhaVogelsDesktop {
             IActivateAudioInterfaceCompletionHandler completionHandler,
             out IActivateAudioInterfaceAsyncOperation activationOperation);
 
-        // Garante que o Discord NUNCA fique mutado no fone de quem está streamando
         public static void EnsureDiscordUnmutedForStreamer() {
             try {
                 IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
@@ -303,10 +322,8 @@ namespace TelinhaVogelsDesktop {
             } catch { }
         }
 
-        // Localiza o PID do processo do Discord para excluí-lo da captura da live (sem mutar no fone!)
         public static uint FindDiscordTargetPid() {
             try {
-                // 1. Procura a árvore raiz do Discord.exe (o processo pai iniciado primeiro engloba todos os subprocessos de áudio)
                 Process[] procs = Process.GetProcessesByName("Discord");
                 if (procs != null && procs.Length > 0) {
                     Process rootProc = procs[0];
@@ -327,9 +344,9 @@ namespace TelinhaVogelsDesktop {
 
         public static IAudioClient CreateProcessExcludedAudioClient(uint excludePid) {
             AUDIOCLIENT_ACTIVATION_PARAMS actParams = new AUDIOCLIENT_ACTIVATION_PARAMS();
-            actParams.ActivationType = 1; // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+            actParams.ActivationType = 1;
             actParams.ProcessLoopbackParams.TargetProcessId = excludePid;
-            actParams.ProcessLoopbackParams.ProcessLoopbackMode = 1; // PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+            actParams.ProcessLoopbackParams.ProcessLoopbackMode = 1;
 
             int size = Marshal.SizeOf(actParams);
             IntPtr ptr = Marshal.AllocHGlobal(size);
@@ -337,7 +354,7 @@ namespace TelinhaVogelsDesktop {
 
             try {
                 PROPVARIANT pv = new PROPVARIANT();
-                pv.vt = 65; // VT_BLOB
+                pv.vt = 65;
                 pv.blob.cbSize = (uint)size;
                 pv.blob.pBlobData = ptr;
 
@@ -368,7 +385,7 @@ namespace TelinhaVogelsDesktop {
             if (client == null) return;
 
             WAVEFORMATEX fmt = new WAVEFORMATEX();
-            fmt.wFormatTag = 1; // WAVE_FORMAT_PCM
+            fmt.wFormatTag = 1;
             fmt.nChannels = 2;
             fmt.nSamplesPerSec = 48000;
             fmt.wBitsPerSample = 16;
@@ -376,7 +393,6 @@ namespace TelinhaVogelsDesktop {
             fmt.nAvgBytesPerSec = 192000;
             fmt.cbSize = 0;
 
-            // AUDCLNT_STREAMFLAGS_LOOPBACK (0x00020000) | AUTOCONVERTPCM (0x80000000) | SRC_DEFAULT_QUALITY (0x08000000)
             int hr = client.Initialize(0, 0x88020000, 200000, 0, ref fmt, IntPtr.Zero);
             if (hr < 0) return;
 
@@ -476,17 +492,17 @@ namespace TelinhaVogelsDesktop {
 
         [STAThread]
         public static void Main(string[] args) {
-            // Garante que o Discord esteja desmutado no mixer do Windows para você ouvir seus amigos normalmente
             EnsureDiscordUnmutedForStreamer();
             StartLocalBridge();
 
-            string url = "${appUrl}/?desktop=1";
+            string url = "${targetUrl}";
             string profileDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TelinhaVogels", "AppProfile");
             Directory.CreateDirectory(profileDir);
 
             string[] browsers = new string[] {
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google\\\\Chrome\\\\Application\\\\chrome.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google\\\\Chrome\\\\Application\\\\chrome.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google\\\\Chrome\\\\Application\\\\chrome.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft\\\\Edge\\\\Application\\\\msedge.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft\\\\Edge\\\\Application\\\\msedge.exe")
             };
@@ -519,7 +535,7 @@ echo ========================================================
 echo   TELINHA VOGELS - INSTALADOR DESKTOP OFICIAL (WINDOWS)
 echo ========================================================
 echo.
-echo [1/3] Encerrando instancias antigas e preparando captura WASAPI...
+echo [1/3] Atualizando motor WASAPI e sincronizacao de salas...
 taskkill /F /IM TelinhaVogels.exe >nul 2>&1
 
 set "APP_DIR=%LOCALAPPDATA%\\TelinhaVogels"
@@ -530,7 +546,7 @@ copy /Y "%~dp0TelinhaVogels.cs" "%APP_DIR%\\TelinhaVogels.cs" >nul
 set "CSC=%WINDIR%\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"
 
-echo [2/3] Compilando executavel nativo (Sem alerta SmartScreen)...
+echo [2/3] Compilando executavel nativo...
 "%CSC%" /target:winexe /nologo /optimize+ /out:"%APP_DIR%\\TelinhaVogels.exe" "%APP_DIR%\\TelinhaVogels.cs"
 
 echo [3/3] Criando atalho 'Telinha Vogels' na Area de Trabalho...
@@ -568,9 +584,13 @@ const activeStreams = new Map();
 io.on('connection', (socket) => {
   let currentRoom = null;
 
-  socket.on('join-room', ({ roomName, nickname }) => {
-    const cleanRoom = String(roomName || 'geral').trim().toLowerCase().slice(0, 40);
+  socket.on('join-room', ({ roomName, roomPassword, nickname }) => {
+    const cleanRoom = normalizeRoomKey(roomName, roomPassword);
     const cleanNick = String(nickname || 'usuario').trim().slice(0, 24);
+
+    if (currentRoom && currentRoom !== cleanRoom) {
+      socket.leave(currentRoom);
+    }
 
     currentRoom = cleanRoom;
     socket.join(cleanRoom);
