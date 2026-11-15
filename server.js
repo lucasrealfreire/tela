@@ -64,7 +64,7 @@ function createZipBuffer(files) {
     centralHeader.writeUInt16LE(0, 32);
     centralHeader.writeUInt16LE(0, 34);
     centralHeader.writeUInt16LE(0, 36);
-    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt16LE(0, 38);
     centralHeader.writeUInt32LE(offset, 42);
     nameBuf.copy(centralHeader, 46);
 
@@ -87,14 +87,13 @@ function createZipBuffer(files) {
   return Buffer.concat([...localParts, ...centralParts, eocd]);
 }
 
-// Normaliza o nome da sala (mesmo se o usuário colar um link inteiro no campo de sala!)
 function normalizeRoomKey(rawRoom, rawPassword) {
   let r = String(rawRoom || 'squad-brasil').trim();
   let p = String(rawPassword || '').trim();
 
   if (r.startsWith('http://') || r.startsWith('https://') || r.includes('?sala=')) {
     try {
-      const urlObj = new URL(r.startsWith('http') ? r : `https://telinha.local/${r}`);
+      const urlObj = new URL(r.startsWith('http') ? r : `https://vogelstv.local/${r}`);
       if (urlObj.searchParams.get('sala')) r = urlObj.searchParams.get('sala');
       if (urlObj.searchParams.get('senha') && !p) p = urlObj.searchParams.get('senha');
     } catch (e) {}
@@ -124,7 +123,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-namespace TelinhaVogelsDesktop {
+namespace VogelsTVDesktop {
     [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
     internal class MMDeviceEnumeratorComObject { }
 
@@ -496,7 +495,7 @@ namespace TelinhaVogelsDesktop {
             StartLocalBridge();
 
             string url = "${targetUrl}";
-            string profileDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TelinhaVogels", "AppProfile");
+            string profileDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VogelsTV", "AppProfile");
             Directory.CreateDirectory(profileDir);
 
             string[] browsers = new string[] {
@@ -530,42 +529,43 @@ namespace TelinhaVogelsDesktop {
 
   const installerCmd = `@echo off
 chcp 65001 >nul
-title Instalador Telinha Vogels Desktop
+title Instalador VogelsTV Desktop
 echo ========================================================
-echo   TELINHA VOGELS - INSTALADOR DESKTOP OFICIAL (WINDOWS)
+echo      VogelsTV - INSTALADOR DESKTOP OFICIAL (WINDOWS)
 echo ========================================================
 echo.
 echo [1/3] Atualizando motor WASAPI e sincronizacao de salas...
+taskkill /F /IM VogelsTV.exe >nul 2>&1
 taskkill /F /IM TelinhaVogels.exe >nul 2>&1
 
-set "APP_DIR=%LOCALAPPDATA%\\TelinhaVogels"
+set "APP_DIR=%LOCALAPPDATA%\\VogelsTV"
 if not exist "%APP_DIR%" mkdir "%APP_DIR%"
 
-copy /Y "%~dp0TelinhaVogels.cs" "%APP_DIR%\\TelinhaVogels.cs" >nul
+copy /Y "%~dp0VogelsTV.cs" "%APP_DIR%\\VogelsTV.cs" >nul
 
 set "CSC=%WINDIR%\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"
 
 echo [2/3] Compilando executavel nativo...
-"%CSC%" /target:winexe /nologo /optimize+ /out:"%APP_DIR%\\TelinhaVogels.exe" "%APP_DIR%\\TelinhaVogels.cs"
+"%CSC%" /target:winexe /nologo /optimize+ /out:"%APP_DIR%\\VogelsTV.exe" "%APP_DIR%\\VogelsTV.cs"
 
-echo [3/3] Criando atalho 'Telinha Vogels' na Area de Trabalho...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut([Environment]::GetFolderPath('Desktop') + '\\Telinha Vogels.lnk'); $s.TargetPath = '%APP_DIR%\\TelinhaVogels.exe'; $s.WorkingDirectory = '%APP_DIR%'; $s.IconLocation = 'shell32.dll,18'; $s.Description = 'Telinha Vogels Desktop'; $s.Save()"
+echo [3/3] Criando atalho 'VogelsTV' na Area de Trabalho...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut([Environment]::GetFolderPath('Desktop') + '\\VogelsTV.lnk'); $s.TargetPath = '%APP_DIR%\\VogelsTV.exe'; $s.WorkingDirectory = '%APP_DIR%'; $s.IconLocation = 'shell32.dll,18'; $s.Description = 'VogelsTV Desktop'; $s.Save()"
 
 echo.
-echo Concluido! Iniciando o Telinha Vogels Desktop...
-start "" "%APP_DIR%\\TelinhaVogels.exe"
+echo Concluido! Iniciando o VogelsTV Desktop...
+start "" "%APP_DIR%\\VogelsTV.exe"
 timeout /t 2 >nul
 exit
 `.replace(/\n/g, '\r\n');
 
   const zipBuffer = createZipBuffer([
-    { name: 'Instalar e Abrir Telinha Vogels.cmd', content: installerCmd },
-    { name: 'TelinhaVogels.cs', content: csharpSource }
+    { name: 'Instalar e Abrir VogelsTV.cmd', content: installerCmd },
+    { name: 'VogelsTV.cs', content: csharpSource }
   ]);
 
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', 'attachment; filename="Telinha-Vogels-Windows.zip"');
+  res.setHeader('Content-Disposition', 'attachment; filename="VogelsTV-Windows.zip"');
   res.send(zipBuffer);
 });
 
@@ -692,5 +692,5 @@ app.get('*', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[TELINHA VOGELS] Rodando na porta ${PORT}`);
+  console.log(`[VogelsTV] Rodando na porta ${PORT}`);
 });

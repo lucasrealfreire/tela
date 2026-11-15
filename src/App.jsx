@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
-// Servidor central unificado: garante que quem abrir pelo App Desktop, por tela-14lf ou por telinha-platform caia SEMPRE na mesma sala!
 const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
 
 const RES_CONFIG = {
@@ -10,13 +9,22 @@ const RES_CONFIG = {
   '1440p': { width: 2560, height: 1440, bitrate: 9000000, label: '2K (1440p)' }
 };
 
+function VogelsLogo({ size = 'text-sm' }) {
+  return (
+    <span className={`font-extrabold tracking-tight select-none ${size}`}>
+      <span className="text-white">Vogels</span>
+      <span className="text-red-500">TV</span>
+    </span>
+  );
+}
+
 function parseRoomInput(rawRoom, rawPass) {
   let r = String(rawRoom || '').trim();
   let p = String(rawPass || '').trim();
 
   if (r.startsWith('http://') || r.startsWith('https://') || r.includes('?sala=')) {
     try {
-      const u = new URL(r.startsWith('http') ? r : `https://telinha.local/${r}`);
+      const u = new URL(r.startsWith('http') ? r : `https://vogelstv.local/${r}`);
       if (u.searchParams.get('sala')) r = u.searchParams.get('sala');
       if (u.searchParams.get('senha') && !p) p = u.searchParams.get('senha');
     } catch (e) {}
@@ -69,9 +77,22 @@ export default function App() {
   const [fps, setFps] = useState(60);
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+  const [showMixer, setShowMixer] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
+
+  // Volume de envio da própria transmissão (0% a 100%, padrão 70% para não chegar estourado para os amigos)
+  const [outgoingVolume, setOutgoingVolume] = useState(() => {
+    const saved = localStorage.getItem('tv_out_vol');
+    return saved !== null ? Number(saved) : 70;
+  });
+
+  // Volume mestre de recepção (0% a 100%)
+  const [masterVolume, setMasterVolume] = useState(() => {
+    const saved = localStorage.getItem('tv_master_vol');
+    return saved !== null ? Number(saved) : 80;
+  });
 
   const [excludeDiscordAudio, setExcludeDiscordAudio] = useState(() => {
     const saved = localStorage.getItem('tv_exclude_discord');
@@ -104,13 +125,13 @@ export default function App() {
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
   const excludeDiscordRef = useRef(excludeDiscordAudio);
+  const outgoingVolumeRef = useRef(outgoingVolume);
 
   const addLog = (msg) => {
     const time = new Date().toLocaleTimeString('pt-BR');
     setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
   };
 
-  // Detecta continuamente a ponte WASAPI do App Windows (funciona tanto na janela do App quanto no navegador!)
   useEffect(() => {
     const checkBridge = async () => {
       try {
@@ -132,6 +153,15 @@ export default function App() {
   }, [excludeDiscordAudio]);
 
   useEffect(() => {
+    outgoingVolumeRef.current = outgoingVolume;
+    localStorage.setItem('tv_out_vol', String(outgoingVolume));
+  }, [outgoingVolume]);
+
+  useEffect(() => {
+    localStorage.setItem('tv_master_vol', String(masterVolume));
+  }, [masterVolume]);
+
+  useEffect(() => {
     qualityRef.current = quality;
     fpsRef.current = fps;
     codecRef.current = codec;
@@ -147,6 +177,28 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('tv_nick', nickname);
   }, [nickname]);
+
+  const setStreamVolume = (streamId, newVol) => {
+    const clamped = Math.max(0, Math.min(100, Number(newVol)));
+    setStreams(prev =>
+      prev.map(s =>
+        s.id === streamId
+          ? { ...s, volume: clamped, muted: clamped === 0 }
+          : s
+      )
+    );
+  };
+
+  const toggleStreamMute = (streamId) => {
+    setStreams(prev =>
+      prev.map(s => {
+        if (s.id !== streamId) return s;
+        const nextMuted = !s.muted;
+        const restoredVol = !nextMuted && (s.volume === 0 || s.volume === undefined) ? 75 : (s.volume ?? 75);
+        return { ...s, muted: nextMuted, volume: restoredVol };
+      })
+    );
+  };
 
   const handlePasteRoomLink = async () => {
     try {
@@ -165,8 +217,6 @@ export default function App() {
     if (!inRoom) return;
 
     const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-
-    // Conecta sempre ao servidor central para evitar conflito entre URLs diferentes ou App vs Navegador
     const targetServer = window.location.hostname.includes('onrender.com')
       ? MASTER_RENDER_URL
       : window.location.origin;
@@ -178,7 +228,7 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      addLog(`Conectado na sala [${cleanRoom}] em ${targetServer}`);
+      addLog(`Conectado ao VogelsTV na sala [${cleanRoom}]`);
       socket.emit('join-room', {
         roomName: cleanRoom,
         roomPassword: cleanPass,
@@ -199,6 +249,7 @@ export default function App() {
             type: st.type,
             res: st.res,
             fps: st.fps,
+            volume: 75,
             muted: false,
             minimized: false,
             isLocal: false
@@ -218,6 +269,7 @@ export default function App() {
           type: st.type,
           res: st.res,
           fps: st.fps,
+          volume: 75,
           muted: false,
           minimized: false,
           isLocal: false
@@ -241,6 +293,7 @@ export default function App() {
             type: 'Tela',
             res: `${meta.h}p`,
             fps: meta.fps || 60,
+            volume: 75,
             muted: false,
             minimized: false,
             isLocal: false
@@ -338,7 +391,8 @@ export default function App() {
               id: streamId,
               ts: chunk.timestamp,
               sr: 48000,
-              ch: 2
+              ch: 2,
+              gain: outgoingVolumeRef.current
             }, buf.buffer);
           },
           error: () => {}
@@ -507,6 +561,7 @@ export default function App() {
         stream: mediaStream,
         res: cfg.label,
         fps: targetFps,
+        volume: 100,
         muted: true,
         minimized: false,
         isLocal: true
@@ -544,6 +599,7 @@ export default function App() {
         stream: mediaStream,
         res: '720p',
         fps: Number(fps),
+        volume: 100,
         muted: true,
         minimized: false,
         isLocal: true
@@ -584,7 +640,7 @@ export default function App() {
     const dlUrl = `/api/download-app?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
     const a = document.createElement('a');
     a.href = dlUrl;
-    a.download = 'Telinha-Vogels-Windows.zip';
+    a.download = 'VogelsTV-Windows.zip';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -607,7 +663,7 @@ export default function App() {
     }
     const a = document.createElement('a');
     a.href = url;
-    a.download = `TelinhaVogels_Clip_${owner}_${Date.now()}.${ext}`;
+    a.download = `VogelsTV_Clip_${owner}_${Date.now()}.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -633,7 +689,7 @@ export default function App() {
       <div className="h-screen w-screen bg-[#0D0F13] flex items-center justify-center p-4">
         <div className="w-full max-w-sm bg-[#151922] border border-[#232936] rounded-xl p-6 shadow-2xl">
           <div className="flex items-center justify-between mb-6">
-            <span className="text-xl font-bold tracking-tight text-white">telinha vogels</span>
+            <VogelsLogo size="text-2xl" />
             {desktopBridgeActive && (
               <span className="text-[11px] bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 px-2 py-0.5 rounded font-medium">
                 App Windows Ativo
@@ -658,7 +714,7 @@ export default function App() {
                 value={nickname}
                 onChange={e => setNickname(e.target.value)}
                 placeholder="Ex: gosadinhas"
-                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
               />
             </div>
             <div>
@@ -667,7 +723,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={handlePasteRoomLink}
-                  className="text-[11px] text-indigo-400 hover:text-indigo-300 cursor-pointer"
+                  className="text-[11px] text-red-400 hover:text-red-300 cursor-pointer"
                 >
                   📋 Colar link da sala
                 </button>
@@ -678,7 +734,7 @@ export default function App() {
                 value={roomName}
                 onChange={e => setRoomName(e.target.value)}
                 placeholder="Ex: squad-brasil"
-                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
               />
             </div>
             <div>
@@ -688,7 +744,7 @@ export default function App() {
                 value={roomPassword}
                 onChange={e => setRoomPassword(e.target.value)}
                 placeholder="Deixe vazio se a sala não tiver senha"
-                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-500"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
               />
             </div>
             <button
@@ -705,23 +761,24 @@ export default function App() {
 
   const activeStreams = streams.filter(s => !s.minimized);
   const minimizedStreams = streams.filter(s => s.minimized);
+  const remoteStreams = streams.filter(s => !s.isLocal);
   const { cleanRoom } = parseRoomInput(roomName, roomPassword);
 
   return (
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
       <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20">
         <div className="flex items-center gap-2">
-          <span className="font-bold text-white text-sm tracking-tight">telinha vogels</span>
+          <VogelsLogo size="text-base" />
           <span className="text-amber-400 text-xs">🔒</span>
-          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-indigo-300 px-2 py-0.5 rounded-full font-mono">
-            Sala: {cleanRoom}
+          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-200 px-2 py-0.5 rounded-full font-mono">
+            {cleanRoom}
           </span>
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-300 px-2 py-0.5 rounded-full">
             {participants.length} online
           </span>
           {discordIsolatedActive && (
             <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full">
-              🛡️ Voz do Discord Isolada da Live
+              🛡️ Voz do Discord Isolada
             </span>
           )}
         </div>
@@ -743,6 +800,106 @@ export default function App() {
             <option value={60}>60 fps</option>
           </select>
 
+          {/* BOTÃO DO MIXER DE ÁUDIO (0% a 100%) */}
+          <div className="relative">
+            <button
+              onClick={() => {
+                setShowMixer(!showMixer);
+                setShowSettings(false);
+              }}
+              className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer ${
+                showMixer ? 'bg-red-600/30 border-red-500 text-white' : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
+              }`}
+              title="Mixer de Volume (0% a 100%)"
+            >
+              <span>🎚️</span> Mixer
+            </button>
+
+            {showMixer && (
+              <div className="absolute right-0 mt-2 w-80 bg-[#141820] border border-[#262C3A] rounded-xl shadow-2xl p-4 z-50 text-left space-y-4">
+                <div className="flex items-center justify-between border-b border-[#222834] pb-2">
+                  <span className="font-semibold text-sm text-white">🎚️ Mixer de Áudio (0% a 100%)</span>
+                  <button onClick={() => setShowMixer(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
+                </div>
+
+                {/* Volume Mestre de Recepção */}
+                <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3 space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-medium text-white">🔊 Volume Geral (Pra Você)</span>
+                    <span className="font-mono text-red-400 font-semibold">{masterVolume}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={masterVolume}
+                    onChange={e => setMasterVolume(Number(e.target.value))}
+                    className="w-full accent-red-500 cursor-pointer"
+                  />
+                  <p className="text-[10px] text-gray-400">
+                    Regula o volume de todas as lives que você está assistindo.
+                  </p>
+                </div>
+
+                {/* Volume de Envio da sua Live */}
+                <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3 space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-medium text-white">🎙️ Volume da Sua Live (Envio)</span>
+                    <span className="font-mono text-indigo-400 font-semibold">{outgoingVolume}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={outgoingVolume}
+                    onChange={e => setOutgoingVolume(Number(e.target.value))}
+                    className="w-full accent-indigo-500 cursor-pointer"
+                  />
+                  <p className="text-[10px] text-gray-400">
+                    Se o som do seu jogo estiver alto demais para seus amigos, abaixe aqui sem alterar o volume do seu Windows.
+                  </p>
+                </div>
+
+                {/* Sliders Individuais de cada Amigo Transmitindo */}
+                <div className="space-y-2">
+                  <span className="block text-[11px] font-semibold uppercase tracking-wider text-gray-400">
+                    Transmissões na Sala
+                  </span>
+                  {remoteStreams.length === 0 ? (
+                    <p className="text-xs text-gray-500 italic">Nenhum amigo transmitindo no momento.</p>
+                  ) : (
+                    remoteStreams.map(rs => (
+                      <div key={rs.id} className="bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 space-y-1.5">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-gray-200 truncate">{rs.owner}</span>
+                          <span className="font-mono text-emerald-400">
+                            {rs.muted ? '0% (Mudo)' : `${rs.volume ?? 75}%`}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => toggleStreamMute(rs.id)}
+                            className="text-xs px-1.5 py-0.5 rounded bg-[#1B202B] hover:bg-[#252C3D] cursor-pointer"
+                          >
+                            {rs.muted || (rs.volume ?? 75) === 0 ? '🔇' : '🔊'}
+                          </button>
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            value={rs.muted ? 0 : (rs.volume ?? 75)}
+                            onChange={e => setStreamVolume(rs.id, e.target.value)}
+                            className="flex-1 accent-emerald-400 cursor-pointer"
+                          />
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
           <button onClick={handleShareCamera} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer">
             <span>📷</span> Câmera
           </button>
@@ -761,7 +918,13 @@ export default function App() {
           </button>
 
           <div className="relative">
-            <button onClick={() => setShowSettings(!showSettings)} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
+            <button
+              onClick={() => {
+                setShowSettings(!showSettings);
+                setShowMixer(false);
+              }}
+              className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer"
+            >
               ⚙️
             </button>
             {showSettings && (
@@ -778,7 +941,7 @@ export default function App() {
                       type="checkbox"
                       checked={excludeDiscordAudio}
                       onChange={e => setExcludeDiscordAudio(e.target.checked)}
-                      className="w-4 h-4 accent-indigo-500 cursor-pointer"
+                      className="w-4 h-4 accent-red-500 cursor-pointer"
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
@@ -845,6 +1008,7 @@ export default function App() {
                   <VideoTile
                     key={streamObj.id}
                     streamObj={streamObj}
+                    masterVolume={masterVolume}
                     socketRef={socketRef}
                     videoChunkHandlersRef={videoChunkHandlersRef}
                     audioChunkHandlersRef={audioChunkHandlersRef}
@@ -853,7 +1017,8 @@ export default function App() {
                     clipConfig={clipConfig}
                     clipDuration={clipDuration}
                     onStop={() => stopStream(streamObj.id)}
-                    onMute={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, muted: !s.muted } : s))}
+                    onMute={() => toggleStreamMute(streamObj.id)}
+                    onVolumeChange={(val) => setStreamVolume(streamObj.id, val)}
                     onMinimize={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s))}
                     onExpand={() => setExpandedId(expandedId === streamObj.id ? null : streamObj.id)}
                     isExpanded={expandedId === streamObj.id}
@@ -875,8 +1040,8 @@ export default function App() {
             </div>
           )}
 
-          <div className="absolute bottom-1.5 left-3 text-[10px] text-gray-600 pointer-events-none">
-            telinha vogels
+          <div className="absolute bottom-1.5 left-3 text-[11px] opacity-60 pointer-events-none">
+            <VogelsLogo size="text-xs" />
           </div>
         </main>
 
@@ -906,7 +1071,7 @@ export default function App() {
                   <p key={m.id} className="text-gray-400 italic text-[11px]">{m.text}</p>
                 ) : (
                   <div key={m.id}>
-                    <span className="font-semibold text-indigo-400">{m.sender}: </span>
+                    <span className="font-semibold text-red-400">{m.sender}: </span>
                     <span className="text-gray-200 break-words">{m.text}</span>
                   </div>
                 )
@@ -918,7 +1083,7 @@ export default function App() {
                 value={chatInput}
                 onChange={e => setChatInput(e.target.value)}
                 placeholder="Mensagem..."
-                className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-indigo-500"
+                className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-red-500"
               />
               <button type="submit" className="bg-[#1C212E] hover:bg-[#252C3D] border border-[#2E364A] text-xs text-gray-200 px-3 py-1.5 rounded-md cursor-pointer">
                 Enviar
@@ -932,18 +1097,20 @@ export default function App() {
         <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-md p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-[#222834] pb-2.5">
-              <h4 className="text-sm font-bold text-white">🖥️ Telinha Vogels — App Windows</h4>
+              <h4 className="text-sm font-bold text-white flex items-center gap-1.5">
+                🖥️ <VogelsLogo size="text-sm" /> — App Windows
+              </h4>
               <button onClick={() => setShowDownloadModal(false)} className="text-xs text-gray-400 hover:text-white px-2 py-0.5 rounded bg-[#1C212C]">✕</button>
             </div>
             <div className="text-xs text-gray-300 space-y-2.5 leading-relaxed">
               <p>
-                O download de <b className="text-white">Telinha-Vogels-Windows.zip</b> já vinculado à sala <b className="text-indigo-300">{cleanRoom}</b> foi iniciado!
+                O download de <b className="text-white">VogelsTV-Windows.zip</b> vinculado à sala <b className="text-red-400">{cleanRoom}</b> foi iniciado!
               </p>
               <div className="bg-[#0D1016] border border-[#1E232E] rounded-lg p-3 space-y-1.5 text-[11px]">
-                <p className="text-indigo-300 font-semibold">Como usar:</p>
-                <p>1. Extraia o arquivo <b>Telinha-Vogels-Windows.zip</b>.</p>
-                <p>2. Dê dois cliques em <b>Instalar e Abrir Telinha Vogels.cmd</b>.</p>
-                <p>3. Ele já abrirá sincronizado no mesmo servidor e na mesma sala do navegador, além de habilitar o isolamento da voz do Discord tanto no App quanto no navegador.</p>
+                <p className="text-red-400 font-semibold">Como usar:</p>
+                <p>1. Extraia o arquivo <b>VogelsTV-Windows.zip</b>.</p>
+                <p>2. Dê dois cliques em <b>Instalar e Abrir VogelsTV.cmd</b>.</p>
+                <p>3. Ele abrirá sincronizado na mesma sala do navegador com isolamento da voz do Discord.</p>
               </div>
             </div>
             <div className="flex justify-end gap-2 pt-1">
@@ -962,7 +1129,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold">Logs telinha vogels</h4>
+              <h4 className="text-sm font-semibold flex items-center gap-1.5">Logs <VogelsLogo size="text-sm" /></h4>
               <button onClick={() => setShowLogs(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
             </div>
             <div className="bg-[#0B0D11] border border-[#1E232E] rounded-lg p-3 h-64 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1">
@@ -989,6 +1156,7 @@ export default function App() {
 
 function VideoTile({
   streamObj,
+  masterVolume,
   socketRef,
   videoChunkHandlersRef,
   audioChunkHandlersRef,
@@ -998,6 +1166,7 @@ function VideoTile({
   clipDuration,
   onStop,
   onMute,
+  onVolumeChange,
   onMinimize,
   onExpand,
   isExpanded,
@@ -1006,12 +1175,26 @@ function VideoTile({
 }) {
   const localVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
+  const gainNodeRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
-  const mutedRef = useRef(streamObj.muted);
 
+  const mutedRef = useRef(streamObj.muted);
+  const volumeRef = useRef(streamObj.volume ?? 75);
+  const masterVolRef = useRef(masterVolume ?? 80);
+
+  // Atualiza o GainNode imediatamente quando o usuário mexe na barra de 0% a 100%
   useEffect(() => {
     mutedRef.current = streamObj.muted;
-  }, [streamObj.muted]);
+    volumeRef.current = streamObj.volume ?? 75;
+    masterVolRef.current = masterVolume ?? 80;
+
+    if (gainNodeRef.current) {
+      const effectiveGain = streamObj.muted
+        ? 0
+        : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
+      gainNodeRef.current.gain.value = effectiveGain;
+    }
+  }, [streamObj.muted, streamObj.volume, masterVolume]);
 
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
@@ -1112,17 +1295,34 @@ function VideoTile({
       }
     };
 
+    // Pipeline de Áudio com GainNode + Limiter suave para NUNCA estourar o áudio
     let audioCtx = null;
     let audioDecoder = null;
     let nextPlayTime = 0;
+    let senderGainFactor = 0.7;
 
     if ('AudioDecoder' in window) {
       try {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = mutedRef.current ? 0 : (volumeRef.current / 100) * (masterVolRef.current / 100);
+
+        // Compressor/Limiter de proteção contra áudio estourado
+        const compressor = audioCtx.createDynamicsCompressor();
+        compressor.threshold.value = -12;
+        compressor.knee.value = 18;
+        compressor.ratio.value = 8;
+        compressor.attack.value = 0.003;
+        compressor.release.value = 0.15;
+
+        gainNode.connect(compressor);
+        compressor.connect(audioCtx.destination);
+        gainNodeRef.current = gainNode;
+
         audioDecoder = new AudioDecoder({
           output: (audioData) => {
             try {
-              if (!mutedRef.current && audioCtx) {
+              if (!mutedRef.current && audioCtx && volumeRef.current > 0) {
                 if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
                 const numFrames = audioData.numberOfFrames;
                 const numCh = audioData.numberOfChannels || 2;
@@ -1133,6 +1333,9 @@ function VideoTile({
                   for (let c = 0; c < numCh; c++) {
                     const chData = new Float32Array(numFrames);
                     audioData.copyTo(chData, { planeIndex: c, format: 'f32-planar' });
+                    for (let i = 0; i < numFrames; i++) {
+                      chData[i] = Math.max(-1, Math.min(1, chData[i] * senderGainFactor));
+                    }
                     audioBuffer.copyToChannel(chData, c);
                   }
                 } else {
@@ -1141,14 +1344,14 @@ function VideoTile({
                   for (let c = 0; c < numCh; c++) {
                     const chData = audioBuffer.getChannelData(c);
                     for (let i = 0; i < numFrames; i++) {
-                      chData[i] = interleaved[i * numCh + c];
+                      chData[i] = Math.max(-1, Math.min(1, interleaved[i * numCh + c] * senderGainFactor));
                     }
                   }
                 }
 
                 const source = audioCtx.createBufferSource();
                 source.buffer = audioBuffer;
-                source.connect(audioCtx.destination);
+                source.connect(gainNode);
                 const now = audioCtx.currentTime;
                 if (nextPlayTime < now || nextPlayTime - now > 0.25) {
                   nextPlayTime = now + 0.02;
@@ -1166,6 +1369,9 @@ function VideoTile({
         audioDecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
 
         audioChunkHandlersRef.current[streamObj.id] = (meta, buffer) => {
+          if (meta && typeof meta.gain === 'number') {
+            senderGainFactor = Math.max(0, Math.min(1, meta.gain / 100));
+          }
           if (audioDecoder.state === 'configured') {
             try {
               audioDecoder.decode(new EncodedAudioChunk({
@@ -1219,6 +1425,8 @@ function VideoTile({
     };
   }, [streamObj.id, streamObj.isLocal]);
 
+  const currentVol = streamObj.muted ? 0 : (streamObj.volume ?? 75);
+
   return (
     <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
       {streamObj.isLocal ? (
@@ -1237,7 +1445,7 @@ function VideoTile({
       )}
 
       <div className="absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs">
-        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
         <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
         <span className="text-emerald-300 font-mono text-[11px]">
           {streamObj.isLocal
@@ -1246,14 +1454,32 @@ function VideoTile({
         </span>
       </div>
 
-      <div className="absolute bottom-2.5 right-2.5 z-30 flex items-center gap-1.5 bg-black/80 p-1.5 rounded-lg border border-white/10">
+      <div className="absolute bottom-2.5 right-2.5 z-30 flex items-center gap-2 bg-black/85 px-2.5 py-1.5 rounded-lg border border-white/10">
+        {!streamObj.isLocal && (
+          <div className="flex items-center gap-1.5 bg-[#1B202B] border border-[#2C3446] px-2 py-0.5 rounded">
+            <button
+              onClick={onMute}
+              className="text-white text-xs cursor-pointer"
+              title={streamObj.muted ? 'Desmutar' : 'Mutar'}
+            >
+              {currentVol === 0 ? '🔇' : currentVol < 50 ? '🔉' : '🔊'}
+            </button>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={currentVol}
+              onChange={(e) => onVolumeChange(e.target.value)}
+              className="w-20 h-1.5 accent-red-500 cursor-pointer"
+              title={`Volume: ${currentVol}%`}
+            />
+            <span className="text-[10px] font-mono text-gray-200 w-7 text-right">
+              {currentVol}%
+            </span>
+          </div>
+        )}
         <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">🎬 Clipe 30s</button>
         <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
-        {!streamObj.isLocal && (
-          <button onClick={onMute} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
-            {streamObj.muted ? '🔇 Mutado' : '🔊 Áudio'}
-          </button>
-        )}
         <button onClick={onMinimize} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">_ Minimizar</button>
         <button onClick={onExpand} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
           {isExpanded ? '🗗 Restaurar' : '⛶ Expandir'}
