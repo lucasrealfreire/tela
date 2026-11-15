@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 
+// Lista reforçada de STUN + múltiplos servidores TURN (UDP, TCP e TLS na porta 443 para furar CGNAT/Firewall)
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -9,7 +10,18 @@ const ICE_SERVERS = [
     urls: [
       'turn:openrelay.metered.ca:80',
       'turn:openrelay.metered.ca:443',
-      'turn:openrelay.metered.ca:443?transport=tcp'
+      'turn:openrelay.metered.ca:443?transport=tcp',
+      'turns:openrelay.metered.ca:443?transport=tcp'
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  },
+  {
+    urls: [
+      'turn:standard.relay.metered.ca:80',
+      'turn:standard.relay.metered.ca:80?transport=tcp',
+      'turn:standard.relay.metered.ca:443',
+      'turns:standard.relay.metered.ca:443?transport=tcp'
     ],
     username: 'openrelayproject',
     credential: 'openrelayproject'
@@ -18,10 +30,10 @@ const ICE_SERVERS = [
 
 export default function App() {
   const [inRoom, setInRoom] = useState(false);
-  const [nickname, setNickname] = useState('gosadinhas');
+  const [nickname, setNickname] = useState(() => localStorage.getItem('tl_nick') || 'gosadinhas');
   const [roomName, setRoomName] = useState('squad-brasil');
 
-  // Controles da Barra Superior (Imagem 1)
+  // Controles da Barra Superior
   const [quality, setQuality] = useState('auto');
   const [sharpness, setSharpness] = useState('detail');
   const [fps, setFps] = useState(30);
@@ -31,9 +43,9 @@ export default function App() {
   const [showIpv6Modal, setShowIpv6Modal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
-  // Configurações Persistentes (Imagem 2)
+  // Configurações (Padrão H264/Auto para evitar tela preta de decodificador AV1)
   const [smoothness, setSmoothness] = useState(() => localStorage.getItem('tl_smooth') || 'smooth');
-  const [codec, setCodec] = useState(() => localStorage.getItem('tl_codec') || 'AV1');
+  const [codec, setCodec] = useState(() => localStorage.getItem('tl_codec') || 'AUTO');
   const [clipConfig, setClipConfig] = useState(() => localStorage.getItem('tl_clip') || '720p');
   const [clipDuration, setClipDuration] = useState(30);
   const [connPolicy, setConnPolicy] = useState(() => localStorage.getItem('tl_policy') || 'auto');
@@ -50,16 +62,18 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [ipv6Diag, setIpv6Diag] = useState({ running: false, hasIpv6: false, candidates: [] });
 
-  // Referências WebRTC e Socket
+  // Refs WebRTC + Fila de Candidatos ICE
   const socketRef = useRef(null);
-  const pcsRef = useRef({}); // key: `${peerId}_${streamId}` -> RTCPeerConnection
+  const pcsRef = useRef({});
+  const pendingCandidatesRef = useRef({});
+  const participantsRef = useRef([]);
   const localStreamsRef = useRef([]);
   const clipChunksRef = useRef({});
   const recordersRef = useRef({});
 
   const addLog = (msg) => {
     const time = new Date().toLocaleTimeString('pt-BR');
-    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
+    setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 140)]);
   };
 
   useEffect(() => {
@@ -68,63 +82,85 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    localStorage.setItem('tl_nick', nickname);
     localStorage.setItem('tl_smooth', smoothness);
     localStorage.setItem('tl_codec', codec);
     localStorage.setItem('tl_clip', clipConfig);
     localStorage.setItem('tl_policy', connPolicy);
-  }, [smoothness, codec, clipConfig, connPolicy]);
+  }, [nickname, smoothness, codec, clipConfig, connPolicy]);
 
-  // Inicializa Socket.IO e Sinalização WebRTC Real
   useEffect(() => {
     if (!inRoom) return;
 
-    const socket = io();
+    const socket = io({ transports: ['websocket', 'polling'] });
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      addLog(`Conectado ao servidor de sinalização (ID: ${socket.id})`);
+      addLog(`Conectado ao servidor (ID: ${socket.id})`);
       socket.emit('join-room', { roomName, nickname });
     });
 
     socket.on('room-users', (usersList) => {
+      participantsRef.current = usersList;
       setParticipants(usersList);
     });
 
     socket.on('user-joined', ({ id, nick }) => {
-      addLog(`${nick} entrou na sala. Sincronizando transmissões ativas...`);
+      addLog(`${nick} entrou na sala. Enviando nossas transmissões ativas...`);
       localStreamsRef.current.forEach(ls => {
         createOfferForPeer(id, ls);
       });
     });
 
     socket.on('webrtc-signal', async ({ senderId, signal, streamMeta }) => {
+      if (!streamMeta?.streamId) return;
       const key = `${senderId}_${streamMeta.streamId}`;
 
-      if (signal.type === 'offer') {
-        const pc = createPeerConnection(senderId, streamMeta);
-        pcsRef.current[key] = pc;
-        await pc.setRemoteDescription(new RTCSessionDescription(signal));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit('webrtc-signal', {
-          targetId: senderId,
-          signal: pc.localDescription,
-          streamMeta
-        });
-      } else if (signal.type === 'answer') {
-        const pc = pcsRef.current[key];
-        if (pc) {
+      try {
+        if (signal.type === 'offer') {
+          addLog(`Recebendo oferta de vídeo de ${streamMeta.owner}...`);
+          const pc = createPeerConnection(senderId, streamMeta, false);
+          pcsRef.current[key] = pc;
+
           await pc.setRemoteDescription(new RTCSessionDescription(signal));
-        }
-      } else if (signal.candidate) {
-        const pc = pcsRef.current[key];
-        if (pc) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-          } catch (e) {
-            addLog(`Erro ICE Candidate: ${e.message}`);
+
+          // Processa candidatos ICE que chegaram antes da oferta terminar
+          const queued = pendingCandidatesRef.current[key] || [];
+          for (const cand of queued) {
+            await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+          }
+          pendingCandidatesRef.current[key] = [];
+
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          socket.emit('webrtc-signal', {
+            targetId: senderId,
+            signal: pc.localDescription,
+            streamMeta
+          });
+        } else if (signal.type === 'answer') {
+          const pc = pcsRef.current[key];
+          if (pc && pc.signalingState !== 'stable') {
+            await pc.setRemoteDescription(new RTCSessionDescription(signal));
+            const queued = pendingCandidatesRef.current[key] || [];
+            for (const cand of queued) {
+              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+            pendingCandidatesRef.current[key] = [];
+            addLog(`Handshake WebRTC concluído para [${streamMeta.streamId}]`);
+          }
+        } else if (signal.candidate) {
+          const pc = pcsRef.current[key];
+          if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate)).catch(() => {});
+          } else {
+            if (!pendingCandidatesRef.current[key]) pendingCandidatesRef.current[key] = [];
+            pendingCandidatesRef.current[key].push(signal.candidate);
           }
         }
+      } catch (err) {
+        addLog(`Erro na sinalização WebRTC: ${err.message}`);
       }
     });
 
@@ -135,7 +171,7 @@ export default function App() {
         delete pcsRef.current[key];
       }
       setStreams(prev => prev.filter(s => s.id !== streamId));
-      addLog(`Transmissão [${streamId}] encerrada pelo participante.`);
+      addLog(`Transmissão encerrada pelo participante.`);
     });
 
     socket.on('user-left', ({ id }) => {
@@ -160,6 +196,7 @@ export default function App() {
   }, [inRoom, roomName, nickname]);
 
   const applyCodecPreference = (pc) => {
+    if (codec === 'AUTO') return;
     try {
       if (!RTCRtpSender.getCapabilities) return;
       const caps = RTCRtpSender.getCapabilities('video');
@@ -177,17 +214,20 @@ export default function App() {
           }
         });
       }
-    } catch (e) {
-      addLog(`Codec fallback automático: ${e.message}`);
-    }
+    } catch (e) {}
   };
 
-  const createPeerConnection = (peerId, streamMeta) => {
-    const config = {
+  const createPeerConnection = (peerId, streamMeta, isInitiator) => {
+    const key = `${peerId}_${streamMeta.streamId}`;
+    if (pcsRef.current[key]) {
+      pcsRef.current[key].close();
+    }
+
+    const pc = new RTCPeerConnection({
       iceServers: ICE_SERVERS,
-      iceTransportPolicy: connPolicy === 'turn' ? 'relay' : 'all'
-    };
-    const pc = new RTCPeerConnection(config);
+      iceTransportPolicy: connPolicy === 'turn' ? 'relay' : 'all',
+      iceCandidatePoolSize: 10
+    });
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -200,48 +240,74 @@ export default function App() {
       }
     };
 
-    pc.ontrack = (event) => {
-      const [remoteStream] = event.streams;
-      if (!remoteStream) return;
+    // Reconstrói o MediaStream remoto garantidamente mesmo quando o navegador envia event.streams vazio
+    const remoteMediaStream = new MediaStream();
 
-      // Ajusta jitter buffer (Suavidade para quem assiste)
-      if (event.receiver && 'playoutDelayHint' in event.receiver) {
-        event.receiver.playoutDelayHint = smoothness === 'smooth' ? 0.35 : smoothness === 'balanced' ? 0.12 : 0.0;
+    pc.ontrack = (event) => {
+      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : remoteMediaStream;
+      if (!event.streams || !event.streams[0]) {
+        remoteMediaStream.addTrack(event.track);
       }
 
+      if (event.receiver && 'playoutDelayHint' in event.receiver) {
+        event.receiver.playoutDelayHint = smoothness === 'smooth' ? 0.3 : smoothness === 'balanced' ? 0.1 : 0.0;
+      }
+
+      const hasAudio = incomingStream.getAudioTracks().length > 0;
+
       setStreams(prev => {
-        if (prev.some(s => s.id === streamMeta.streamId)) return prev;
+        const exists = prev.find(s => s.id === streamMeta.streamId);
+        if (exists) {
+          return prev.map(s => s.id === streamMeta.streamId ? { ...s, stream: incomingStream, hasAudio } : s);
+        }
         const newObj = {
           id: streamMeta.streamId,
           peerId,
           owner: streamMeta.owner,
           type: streamMeta.type,
-          stream: remoteStream,
-          muted: false,
+          stream: incomingStream,
+          // Começa mutado se tiver áudio para o Chrome NÃO bloquear o vídeo (Autoplay Policy)
+          muted: hasAudio,
+          hasAudio,
           minimized: false,
           fps: streamMeta.fps,
           res: streamMeta.res,
-          bitrate: '8.0 Mbps',
+          bitrate: 'Conectado',
           isLocal: false
         };
-        startCircularClipBuffer(streamMeta.streamId, remoteStream);
-        addLog(`Recebendo vídeo WebRTC de ${streamMeta.owner} (${streamMeta.res} @ ${streamMeta.fps}fps)`);
+        startCircularClipBuffer(streamMeta.streamId, incomingStream);
+        addLog(`Vídeo recebido de ${streamMeta.owner} (${streamMeta.res} @ ${streamMeta.fps}fps)`);
         return [...prev, newObj];
       });
     };
 
     pc.oniceconnectionstatechange = () => {
-      addLog(`Estado ICE (${streamMeta.owner}): ${pc.iceConnectionState}`);
-      if (pc.iceConnectionState === 'connected') {
+      const state = pc.iceConnectionState;
+      addLog(`ICE [${streamMeta.owner}]: ${state}`);
+
+      if (state === 'connected' || state === 'completed') {
         pc.getStats().then(stats => {
           stats.forEach(report => {
             if (report.type === 'candidate-pair' && report.state === 'succeeded') {
               socketRef.current?.emit('update-conn-type', {
-                connType: connPolicy === 'turn' ? 'TURN Plano B' : 'IPv6 / P2P'
+                connType: connPolicy === 'turn' ? 'TURN Plano B' : 'WebRTC Ativo'
               });
             }
           });
         });
+      } else if ((state === 'failed' || state === 'disconnected') && isInitiator) {
+        addLog(`Conexão instável com ${streamMeta.owner}. Executando ICE Restart (Plano B TURN)...`);
+        try {
+          pc.restartIce();
+          pc.createOffer({ iceRestart: true }).then(offer => {
+            pc.setLocalDescription(offer);
+            socketRef.current?.emit('webrtc-signal', {
+              targetId: peerId,
+              signal: offer,
+              streamMeta
+            });
+          });
+        } catch (e) {}
       }
     };
 
@@ -257,17 +323,19 @@ export default function App() {
       fps: localStreamObj.fps
     };
     const key = `${targetPeerId}_${localStreamObj.id}`;
-    const pc = createPeerConnection(targetPeerId, streamMeta);
+    const pc = createPeerConnection(targetPeerId, streamMeta, true);
     pcsRef.current[key] = pc;
 
     localStreamObj.stream.getTracks().forEach(track => {
       const sender = pc.addTrack(track, localStreamObj.stream);
       if (track.kind === 'video') {
-        const params = sender.getParameters();
-        if (!params.encodings) params.encodings = [{}];
-        params.encodings[0].maxBitrate = 8000000; // Meta de 8.000 Kbps adaptativos
-        params.encodings[0].maxFramerate = Number(localStreamObj.fps);
-        sender.setParameters(params).catch(() => {});
+        try {
+          const params = sender.getParameters();
+          if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+          params.encodings[0].maxBitrate = 6000000;
+          params.encodings[0].maxFramerate = Number(localStreamObj.fps);
+          sender.setParameters(params).catch(() => {});
+        } catch (e) {}
       }
     });
 
@@ -286,45 +354,45 @@ export default function App() {
   // Buffer Circular de 30s (SOMENTE VÍDEO — ZERO ÁUDIO)
   const startCircularClipBuffer = (streamId, mediaStream) => {
     if (clipConfig === 'off') return;
-    try {
-      const videoTracks = mediaStream.getVideoTracks();
-      if (!videoTracks.length) return;
-      const videoOnlyStream = new MediaStream([videoTracks[0]]);
-      const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')
-        ? 'video/mp4;codecs=avc1'
-        : MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-        ? 'video/webm;codecs=vp9'
-        : 'video/webm';
+    setTimeout(() => {
+      try {
+        const videoTracks = mediaStream.getVideoTracks();
+        if (!videoTracks.length) return;
+        const videoOnlyStream = new MediaStream([videoTracks[0]]);
+        const mimeType = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')
+          ? 'video/mp4;codecs=avc1'
+          : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+          ? 'video/webm;codecs=vp8'
+          : 'video/webm';
 
-      const recorder = new MediaRecorder(videoOnlyStream, {
-        mimeType,
-        videoBitsPerSecond: clipConfig === '1080p' ? 6000000 : 3500000
-      });
+        const recorder = new MediaRecorder(videoOnlyStream, {
+          mimeType,
+          videoBitsPerSecond: clipConfig === '1080p' ? 5000000 : 3000000
+        });
 
-      clipChunksRef.current[streamId] = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          const list = clipChunksRef.current[streamId] || [];
-          list.push({ blob: e.data, ts: Date.now() });
-          const cutoff = Date.now() - clipDuration * 1000;
-          if (list.length > 2) {
-            clipChunksRef.current[streamId] = [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)];
-          } else {
-            clipChunksRef.current[streamId] = list;
+        clipChunksRef.current[streamId] = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            const list = clipChunksRef.current[streamId] || [];
+            list.push({ blob: e.data, ts: Date.now() });
+            const cutoff = Date.now() - clipDuration * 1000;
+            if (list.length > 2) {
+              clipChunksRef.current[streamId] = [list[0], ...list.slice(1).filter(i => i.ts >= cutoff)];
+            } else {
+              clipChunksRef.current[streamId] = list;
+            }
           }
-        }
-      };
-      recorder.start(1000);
-      recordersRef.current[streamId] = { recorder, mimeType };
-    } catch (err) {
-      addLog(`Aviso no buffer de clipe: ${err.message}`);
-    }
+        };
+        recorder.start(1000);
+        recordersRef.current[streamId] = { recorder, mimeType };
+      } catch (err) {}
+    }, 1000);
   };
 
   const saveClip30s = (streamObj, openReplayOnly = false) => {
     const chunks = clipChunksRef.current[streamObj.id] || [];
     if (!chunks.length) {
-      alert('Aguarde alguns segundos de transmissão para acumular o buffer de 30 segundos.');
+      alert('Aguarde pelo menos 2 segundos de vídeo para acumular o buffer de 30 segundos.');
       return;
     }
     const mime = recordersRef.current[streamObj.id]?.mimeType || 'video/webm';
@@ -346,7 +414,6 @@ export default function App() {
     addLog(`Clipe de ${clipDuration}s (sem áudio) salvo em Downloads!`);
   };
 
-  // Compartilhar Tela / Jogo / Janela / Aba
   const handleShareScreen = async () => {
     try {
       const resMap = {
@@ -382,10 +449,11 @@ export default function App() {
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
         muted: true,
+        hasAudio: false,
         minimized: false,
         fps: targetFps,
         res: quality === 'auto' ? '1080p' : quality,
-        bitrate: '8.0 Mbps',
+        bitrate: 'Ao Vivo',
         isLocal: true
       };
 
@@ -393,13 +461,13 @@ export default function App() {
       setStreams(prev => [...prev, newStreamObj]);
       startCircularClipBuffer(newId, mediaStream);
 
-      participants.forEach(p => {
+      participantsRef.current.forEach(p => {
         if (p.id !== socketRef.current?.id) {
           createOfferForPeer(p.id, newStreamObj);
         }
       });
 
-      addLog(`Compartilhamento iniciado (${newStreamObj.res} @ ${targetFps}fps, Codec: ${codec})`);
+      addLog(`Compartilhamento iniciado (${newStreamObj.res} @ ${targetFps}fps)`);
     } catch (err) {
       addLog(`Compartilhamento cancelado: ${err.message}`);
     }
@@ -422,10 +490,11 @@ export default function App() {
         type: 'Câmera',
         stream: mediaStream,
         muted: true,
+        hasAudio: false,
         minimized: false,
         fps: Number(fps),
         res: '720p',
-        bitrate: '2.5 Mbps',
+        bitrate: 'Ao Vivo',
         isLocal: true
       };
 
@@ -433,7 +502,7 @@ export default function App() {
       setStreams(prev => [...prev, newStreamObj]);
       startCircularClipBuffer(newId, mediaStream);
 
-      participants.forEach(p => {
+      participantsRef.current.forEach(p => {
         if (p.id !== socketRef.current?.id) {
           createOfferForPeer(p.id, newStreamObj);
         }
@@ -544,7 +613,6 @@ export default function App() {
 
   return (
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
-      {/* BARRA SUPERIOR (Imagem 1) */}
       <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20">
         <div className="flex items-center gap-2">
           <span className="font-bold text-white text-sm tracking-tight">telinha</span>
@@ -593,7 +661,6 @@ export default function App() {
             Compartilhar tela
           </button>
 
-          {/* Popover de Configurações (Imagem 2) */}
           <div className="relative">
             <button onClick={() => setShowSettings(!showSettings)} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
               ⚙️
@@ -612,22 +679,16 @@ export default function App() {
                     <option value="balanced">Equilibrado</option>
                     <option value="responsive">Mais responsivo (menor latência)</option>
                   </select>
-                  <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Se a tela dá umas engasgadas, use "Mais suave": fica uns décimos de segundo atrasado, mas fluido.
-                  </p>
                 </div>
 
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Codec de vídeo (para quem compartilha)</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="AV1">AV1 (mais novo, pesa bastante)</option>
-                    <option value="VP9">VP9 (alta qualidade)</option>
+                    <option value="AUTO">Automático (H.264 / VP8 — Recomendado)</option>
                     <option value="H264">H.264 (NVENC / Hardware)</option>
-                    <option value="VP8">VP8 (padrão)</option>
+                    <option value="VP9">VP9 (Alta Qualidade)</option>
+                    <option value="AV1">AV1 (Mais novo, pesa bastante)</option>
                   </select>
-                  <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Se travar ou engasgar, volte para o padrão. Muda na hora.
-                  </p>
                 </div>
 
                 <div>
@@ -637,29 +698,21 @@ export default function App() {
                     <option value="1080p">Ligado · 1080p</option>
                     <option value="off">Desligado</option>
                   </select>
-                  <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Guarda os últimos 30s de cada live (somente vídeo, sem áudio). 🎬 salva um clipe MP4; ⏪ abre o replay.
-                  </p>
                 </div>
 
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Modo de Conexão</label>
                   <select value={connPolicy} onChange={e => setConnPolicy(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
                     <option value="auto">Automático (IPv6 Direto + Plano B)</option>
+                    <option value="turn">Forçar Plano B (TURN Relay — se ficar preto)</option>
                     <option value="ipv6">Somente Conexão Direta (IPv6)</option>
-                    <option value="turn">Somente Plano B (TURN Relay)</option>
                   </select>
                 </div>
 
                 <div className="pt-1 border-t border-[#222834]">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-gray-200">Remover sons do Discord (App Desktop)</span>
-                    <input type="checkbox" checked={removeDiscordAudio} onChange={e => setRemoveDiscordAudio(e.target.checked)} className="accent-indigo-500" />
-                  </div>
                   <button onClick={runIpv6Diagnostic} className="w-full bg-[#1B202B] hover:bg-[#242B3A] border border-[#2E3646] rounded-lg py-2 text-xs font-medium text-white flex items-center justify-center gap-1.5 cursor-pointer">
                     <span>🌐</span> Assistente de IPv6
                   </button>
-                  <p className="text-[10px] text-gray-500 mt-2">Fica salvo neste navegador.</p>
                 </div>
               </div>
             )}
@@ -669,7 +722,7 @@ export default function App() {
             📋 Logs
           </button>
 
-          <button onClick={() => alert('App Desktop Tauri configurado para compilar via cargo tauri build.')} className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer">
+          <button onClick={() => alert('App Desktop Tauri pronto.')} className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer">
             Baixar app
           </button>
 
@@ -683,7 +736,6 @@ export default function App() {
         </div>
       </header>
 
-      {/* ÁREA CENTRAL + BARRA LATERAL */}
       <div className="flex-1 flex overflow-hidden">
         <main className="flex-1 bg-[#0B0D11] relative flex flex-col p-3 overflow-hidden">
           {activeStreams.length === 0 ? (
@@ -826,25 +878,44 @@ export default function App() {
 
 function VideoTile({ streamObj, onStop, onMute, onMinimize, onExpand, isExpanded, onClip, onReplay }) {
   const videoRef = useRef(null);
+
   useEffect(() => {
-    if (videoRef.current && streamObj.stream) {
-      videoRef.current.srcObject = streamObj.stream;
-    }
+    const el = videoRef.current;
+    if (!el || !streamObj.stream) return;
+
+    el.srcObject = streamObj.stream;
+
+    const tryPlay = () => {
+      el.play().catch(() => {
+        // Se o Chrome bloquear por causa de áudio, força mudo e dá play no vídeo imediatamente
+        el.muted = true;
+        el.play().catch(() => {});
+      });
+    };
+
+    tryPlay();
+    streamObj.stream.onaddtrack = () => tryPlay();
   }, [streamObj.stream]);
 
   return (
     <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
-      <video ref={videoRef} autoPlay playsInline muted={streamObj.muted} className="w-full h-full object-contain bg-black" />
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={streamObj.muted}
+        className="w-full h-full object-contain bg-black"
+      />
       <div className="absolute top-2.5 left-2.5 flex items-center gap-2 bg-black/75 px-2.5 py-1 rounded-md border border-white/10 text-xs">
         <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
-        <span className="font-semibold text-white">{streamObj.owner}</span>
+        <span className="font-semibold text-white">{streamObj.owner} {streamObj.isLocal && '(Você)'}</span>
         <span className="text-gray-400 text-[11px]">· {streamObj.res} · {streamObj.fps} FPS</span>
       </div>
       <div className="absolute bottom-2.5 right-2.5 flex items-center gap-1.5 bg-black/80 p-1.5 rounded-lg border border-white/10">
         <button onClick={onClip} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2.5 py-1 rounded cursor-pointer">🎬 Clipe 30s</button>
         <button onClick={onReplay} className="bg-[#1E2433] hover:bg-indigo-600 text-white text-[11px] px-2 py-1 rounded cursor-pointer">⏪ Replay</button>
         <button onClick={onMute} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
-          {streamObj.muted ? '🔇 Mutado' : '🔊 Áudio'}
+          {streamObj.muted ? '🔇 Ativar Som' : '🔊 Áudio'}
         </button>
         <button onClick={onMinimize} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">_ Minimizar</button>
         <button onClick={onExpand} className="bg-[#1E2433] hover:bg-[#2A3246] text-white text-[11px] px-2 py-1 rounded cursor-pointer">
