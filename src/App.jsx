@@ -1,13 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { io } from 'socket.io-client';
 
-const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turn:openrelay.metered.ca:443?transport=tcp',
+      'turns:openrelay.metered.ca:443?transport=tcp'
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject'
+  }
+];
 
-// Bitrates otimizados para não estourar limite de banda no modo Relay e entregar 60fps lisos no P2P
 const RES_CONFIG = {
-  '720p': { width: 1280, height: 720, bitrate: 1800000, p2pBitrate: 6000000, label: '720p' },
-  '1080p': { width: 1920, height: 1080, bitrate: 2800000, p2pBitrate: 10000000, label: '1080p' },
-  '1440p': { width: 2560, height: 1440, bitrate: 4200000, p2pBitrate: 15000000, label: '2K (1440p)' }
+  '720p': { width: 1280, height: 720, bitrate: 2200000, label: '720p' },
+  '1080p': { width: 1920, height: 1080, bitrate: 4000000, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, bitrate: 6500000, label: '2K (1440p)' }
 };
 
 function VogelsLogo({ size = 'text-sm' }) {
@@ -33,9 +45,12 @@ function parseRoomInput(rawRoom, rawPass) {
       if (u.searchParams.get('senha') && !p) p = u.searchParams.get('senha');
     } catch (e) {}
   }
+  const cleanRoom = r.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32) || 'squad-brasil';
+  const cleanPass = p.toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 20);
   return {
-    cleanRoom: r.toLowerCase().replace(/\s+/g, '-').slice(0, 40) || 'squad-brasil',
-    cleanPass: p.toLowerCase().slice(0, 30)
+    cleanRoom,
+    cleanPass,
+    hostPeerId: `vtv-room-${cleanRoom}${cleanPass ? '-' + cleanPass : ''}`
   };
 }
 
@@ -187,6 +202,7 @@ export default function App() {
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
 
+  const [myPeerId, setMyPeerId] = useState('');
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
@@ -195,9 +211,12 @@ export default function App() {
   ]);
   const [chatInput, setChatInput] = useState('');
 
-  const socketRef = useRef(null);
+  // Refs do Motor Serverless P2P Mesh (Funciona em .workers.dev, .pages.dev e Render sem precisar de backend!)
   const peerRef = useRef(null);
-  const participantsRef = useRef([]);
+  const isHostRef = useRef(false);
+  const dataConnsRef = useRef(new Map()); // peerId -> DataConnection
+  const roomUsersMapRef = useRef(new Map()); // peerId -> { id, nick }
+  const activeStreamsMapRef = useRef(new Map()); // streamId -> meta
   const localStreamsRef = useRef([]);
   const activeEncodersRef = useRef({});
   const videoChunkHandlersRef = useRef({});
@@ -239,6 +258,305 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('tv_nick', nickname);
   }, [nickname]);
+
+  // Envia mensagem de controle ou binário para todos os participantes conectados na malha WebRTC
+  const broadcastPacket = (packet, excludePeerId = null) => {
+    dataConnsRef.current.forEach((conn, pid) => {
+      if (pid !== excludePeerId && conn && conn.open) {
+        try { conn.send(packet); } catch (e) {}
+      }
+    });
+  };
+
+  const syncRoomStateFromHost = () => {
+    if (!isHostRef.current) return;
+    const usersArray = Array.from(roomUsersMapRef.current.values());
+    const streamsArray = Array.from(activeStreamsMapRef.current.values());
+    setParticipants(usersArray);
+    broadcastPacket({
+      type: 'room-sync',
+      users: usersArray,
+      streams: streamsArray
+    });
+  };
+
+  // Inicializa a Sala Serverless P2P (PeerJS Cloud + WebRTC DataChannel & MediaChannel)
+  useEffect(() => {
+    if (!inRoom || !window.Peer) return;
+
+    const { hostPeerId } = parseRoomInput(roomName, roomPassword);
+    let destroyed = false;
+    let currentPeer = null;
+
+    const handleIncomingPacket = (pkt, fromPeerId) => {
+      if (!pkt || typeof pkt !== 'object') return;
+
+      if (pkt.type === 'join-request' && isHostRef.current) {
+        roomUsersMapRef.current.set(fromPeerId, { id: fromPeerId, nick: pkt.nick || 'Amigo' });
+        syncRoomStateFromHost();
+        // Envia as streams locais do Host para quem acabou de entrar
+        localStreamsRef.current.forEach(ls => {
+          try {
+            currentPeer.call(fromPeerId, ls.stream, {
+              metadata: {
+                streamId: ls.id,
+                senderId: currentPeer.id,
+                owner: nickname,
+                type: ls.type,
+                res: ls.res,
+                fps: ls.fps
+              }
+            });
+          } catch (e) {}
+        });
+        Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+      } else if (pkt.type === 'room-sync') {
+        if (Array.isArray(pkt.users)) {
+          setParticipants(pkt.users);
+          // Conecta diretamente aos demais membros da sala (Mesh completa)
+          pkt.users.forEach(u => {
+            if (u.id !== currentPeer.id && !dataConnsRef.current.has(u.id)) {
+              const c = currentPeer.connect(u.id, { reliable: true });
+              setupDataConnection(c);
+            }
+          });
+        }
+        if (Array.isArray(pkt.streams)) {
+          handleActiveStreamsList(pkt.streams, currentPeer.id);
+        }
+      } else if (pkt.type === 'start-stream') {
+        if (isHostRef.current) {
+          activeStreamsMapRef.current.set(pkt.meta.streamId, pkt.meta);
+          syncRoomStateFromHost();
+        }
+        handleStreamStarted(pkt.meta, currentPeer.id);
+      } else if (pkt.type === 'stop-stream') {
+        if (isHostRef.current) {
+          activeStreamsMapRef.current.delete(pkt.streamId);
+          syncRoomStateFromHost();
+        }
+        stoppedWatchingSetRef.current.delete(pkt.streamId);
+        clipManagersRef.current[pkt.streamId]?.destroy?.();
+        delete clipManagersRef.current[pkt.streamId];
+        setStreams(prev => prev.filter(s => s.id !== pkt.streamId));
+      } else if (pkt.type === 'chat-message') {
+        setMessages(prev => prev.some(m => m.id === pkt.msg.id) ? prev : [...prev, pkt.msg]);
+        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
+      } else if (pkt.type === 'request-keyframe') {
+        Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
+      } else if (pkt.type === 'v-chunk') {
+        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
+        if (!stoppedWatchingSetRef.current.has(pkt.meta.id)) {
+          const handler = videoChunkHandlersRef.current[pkt.meta.id];
+          if (handler) handler(pkt.meta, pkt.buffer);
+        }
+      } else if (pkt.type === 'a-chunk') {
+        if (isHostRef.current) broadcastPacket(pkt, fromPeerId);
+        if (!stoppedWatchingSetRef.current.has(pkt.meta.id)) {
+          const handler = audioChunkHandlersRef.current[pkt.meta.id];
+          if (handler) handler(pkt.meta, pkt.buffer);
+        }
+      }
+    };
+
+    const setupDataConnection = (conn) => {
+      if (!conn) return;
+      conn.on('open', () => {
+        dataConnsRef.current.set(conn.peer, conn);
+        if (!isHostRef.current && conn.peer === hostPeerId) {
+          conn.send({ type: 'join-request', nick: nickname });
+        }
+        // Se estamos transmitindo tela, liga chamada WebRTC de vídeo direto para este par
+        localStreamsRef.current.forEach(ls => {
+          try {
+            currentPeer.call(conn.peer, ls.stream, {
+              metadata: {
+                streamId: ls.id,
+                senderId: currentPeer.id,
+                owner: nickname,
+                type: ls.type,
+                res: ls.res,
+                fps: ls.fps
+              }
+            });
+          } catch (e) {}
+        });
+      });
+
+      conn.on('data', (data) => handleIncomingPacket(data, conn.peer));
+
+      const handleDisconnect = () => {
+        dataConnsRef.current.delete(conn.peer);
+        if (isHostRef.current) {
+          roomUsersMapRef.current.delete(conn.peer);
+          for (const [sId, sMeta] of activeStreamsMapRef.current.entries()) {
+            if (sMeta.senderId === conn.peer) {
+              activeStreamsMapRef.current.delete(sId);
+              broadcastPacket({ type: 'stop-stream', streamId: sId });
+              setStreams(prev => prev.filter(s => s.id !== sId));
+            }
+          }
+          syncRoomStateFromHost();
+        }
+      };
+
+      conn.on('close', handleDisconnect);
+      conn.on('error', handleDisconnect);
+    };
+
+    const bindPeerEvents = (peer, asHost) => {
+      currentPeer = peer;
+      peerRef.current = peer;
+      isHostRef.current = asHost;
+
+      peer.on('open', (id) => {
+        if (destroyed) return;
+        setMyPeerId(id);
+        if (asHost) {
+          roomUsersMapRef.current.set(id, { id, nick: nickname });
+          setParticipants([{ id, nick: nickname }]);
+        } else {
+          // Conecta ao Host da sala
+          const hostConn = peer.connect(hostPeerId, { reliable: true });
+          setupDataConnection(hostConn);
+        }
+      });
+
+      peer.on('connection', (conn) => {
+        setupDataConnection(conn);
+      });
+
+      peer.on('call', (call) => {
+        call.answer();
+        call.on('stream', (remoteMediaStream) => {
+          const meta = call.metadata || {};
+          if (!meta.streamId) return;
+          setStreams(prev => {
+            const exists = prev.find(s => s.id === meta.streamId);
+            if (exists) {
+              return prev.map(s => s.id === meta.streamId ? { ...s, p2pStream: remoteMediaStream } : s);
+            }
+            const isStopped = stoppedWatchingSetRef.current.has(meta.streamId);
+            return [
+              ...prev,
+              {
+                id: meta.streamId,
+                senderId: meta.senderId,
+                owner: meta.owner || 'Participante',
+                type: meta.type || 'Tela',
+                res: meta.res || '1080p',
+                fps: meta.fps || 60,
+                p2pStream: remoteMediaStream,
+                volume: 75,
+                muted: false,
+                minimized: false,
+                watching: !isStopped,
+                watchSession: 1,
+                isLocal: false
+              }
+            ];
+          });
+        });
+      });
+
+      peer.on('error', (err) => {
+        // Se o ID de Host já estiver ocupado na sala, entra automaticamente como Cliente conectado ao Host!
+        if (asHost && err.type === 'unavailable-id') {
+          try { peer.destroy(); } catch (e) {}
+          const clientPeer = new window.Peer(undefined, { config: { iceServers: ICE_SERVERS } });
+          bindPeerEvents(clientPeer, false);
+        }
+      });
+    };
+
+    // Tenta iniciar como Host da sala; se já houver alguém na sala, entra como Cliente
+    const initialPeer = new window.Peer(hostPeerId, { config: { iceServers: ICE_SERVERS } });
+    bindPeerEvents(initialPeer, true);
+
+    return () => {
+      destroyed = true;
+      Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
+      Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
+      dataConnsRef.current.clear();
+      roomUsersMapRef.current.clear();
+      activeStreamsMapRef.current.clear();
+      try { if (currentPeer) currentPeer.destroy(); } catch (e) {}
+    };
+  }, [inRoom, roomName, roomPassword, nickname]);
+
+  const handleActiveStreamsList = (list, selfId) => {
+    setStreams(prev => {
+      const localOnes = prev.filter(s => s.isLocal);
+      const updatedRemotes = [];
+
+      list.forEach(st => {
+        if (st.senderId === selfId) return;
+        const existing = prev.find(p => p.id === st.streamId);
+        if (existing) {
+          updatedRemotes.push({
+            ...existing,
+            senderId: st.senderId,
+            owner: st.owner,
+            res: st.res,
+            fps: st.fps
+          });
+        } else {
+          const isStopped = stoppedWatchingSetRef.current.has(st.streamId);
+          updatedRemotes.push({
+            id: st.streamId,
+            senderId: st.senderId,
+            owner: st.owner,
+            type: st.type,
+            res: st.res,
+            fps: st.fps,
+            volume: 75,
+            muted: false,
+            minimized: false,
+            watching: !isStopped,
+            watchSession: 1,
+            isLocal: false
+          });
+        }
+      });
+
+      return [...localOnes, ...updatedRemotes];
+    });
+  };
+
+  const handleStreamStarted = (st, selfId) => {
+    if (st.senderId === selfId) return;
+    stoppedWatchingSetRef.current.delete(st.streamId);
+
+    setStreams(prev => {
+      const exists = prev.find(s => s.id === st.streamId);
+      if (exists) {
+        return prev.map(s =>
+          s.id === st.streamId
+            ? { ...s, senderId: st.senderId, watching: true, minimized: false, watchSession: (s.watchSession || 0) + 1 }
+            : s
+        );
+      }
+      return [
+        ...prev,
+        {
+          id: st.streamId,
+          senderId: st.senderId,
+          owner: st.owner,
+          type: st.type,
+          res: st.res,
+          fps: st.fps,
+          volume: 75,
+          muted: false,
+          minimized: false,
+          watching: true,
+          watchSession: 1,
+          isLocal: false
+        }
+      ];
+    });
+    broadcastPacket({ type: 'request-keyframe', streamId: st.streamId });
+  };
 
   const setStreamVolume = (streamId, newVol) => {
     const clamped = Math.max(0, Math.min(100, Number(newVol)));
@@ -283,7 +601,7 @@ export default function App() {
     );
 
     if (shouldWatch) {
-      socketRef.current?.emit('request-keyframe', { streamId });
+      broadcastPacket({ type: 'request-keyframe', streamId });
     }
   };
 
@@ -299,249 +617,10 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    if (!inRoom) return;
-
-    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-    // Se estiver hospedado no Cloudflare Pages (pages.dev) ou Render, usa o sinalizador unificado
-    const targetServer = (window.location.hostname.includes('onrender.com') || window.location.hostname.includes('pages.dev'))
-      ? MASTER_RENDER_URL
-      : window.location.origin;
-
-    const socket = io(targetServer, {
-      transports: ['websocket', 'polling'],
-      reconnection: true
-    });
-    socketRef.current = socket;
-
-    // Inicializa PeerJS P2P Direto (Transmite direto entre os PCs no Cloudflare Pages sem gastar banda do Render!)
-    let myPeer = null;
-    if (window.Peer) {
-      try {
-        myPeer = new window.Peer(undefined, {
-          config: {
-            iceServers: [
-              { urls: 'stun:stun.l.google.com:19302' },
-              { urls: 'stun:stun.cloudflare.com:3478' }
-            ]
-          }
-        });
-        peerRef.current = myPeer;
-
-        myPeer.on('open', (peerId) => {
-          socket.emit('join-room', {
-            roomName: cleanRoom,
-            roomPassword: cleanPass,
-            nickname,
-            peerId
-          });
-        });
-
-        myPeer.on('call', (call) => {
-          call.answer();
-          call.on('stream', (remoteMediaStream) => {
-            const meta = call.metadata || {};
-            if (!meta.streamId) return;
-            setStreams(prev => {
-              const exists = prev.find(s => s.id === meta.streamId);
-              if (exists) {
-                return prev.map(s => s.id === meta.streamId ? { ...s, p2pStream: remoteMediaStream } : s);
-              }
-              const isStopped = stoppedWatchingSetRef.current.has(meta.streamId);
-              return [
-                ...prev,
-                {
-                  id: meta.streamId,
-                  senderId: meta.senderId,
-                  owner: meta.owner || 'Participante',
-                  type: meta.type || 'Tela',
-                  res: meta.res || '1080p',
-                  fps: meta.fps || 60,
-                  p2pStream: remoteMediaStream,
-                  volume: 75,
-                  muted: false,
-                  minimized: false,
-                  watching: !isStopped,
-                  watchSession: 1,
-                  isLocal: false
-                }
-              ];
-            });
-          });
-        });
-      } catch (e) {}
-    }
-
-    socket.on('connect', () => {
-      socket.emit('join-room', {
-        roomName: cleanRoom,
-        roomPassword: cleanPass,
-        nickname,
-        peerId: myPeer?.id || null
-      });
-    });
-
-    socket.on('room-users', (list) => {
-      participantsRef.current = list;
-      setParticipants(list);
-      // Envia stream P2P direto para novos participantes que tiverem peerId
-      if (myPeer) {
-        list.forEach(u => {
-          if (u.id !== socket.id && u.peerId) {
-            localStreamsRef.current.forEach(ls => {
-              try {
-                myPeer.call(u.peerId, ls.stream, {
-                  metadata: {
-                    streamId: ls.id,
-                    senderId: socket.id,
-                    owner: nickname,
-                    type: ls.type,
-                    res: ls.res,
-                    fps: ls.fps
-                  }
-                });
-              } catch (e) {}
-            });
-          }
-        });
-      }
-    });
-
-    socket.on('active-streams', (list) => {
-      setStreams(prev => {
-        const localOnes = prev.filter(s => s.isLocal);
-        const updatedRemotes = [];
-
-        list.forEach(st => {
-          if (st.senderId === socket.id) return;
-          const existing = prev.find(p => p.id === st.streamId);
-          if (existing) {
-            updatedRemotes.push({
-              ...existing,
-              senderId: st.senderId,
-              owner: st.owner,
-              res: st.res,
-              fps: st.fps
-            });
-          } else {
-            const isStopped = stoppedWatchingSetRef.current.has(st.streamId);
-            updatedRemotes.push({
-              id: st.streamId,
-              senderId: st.senderId,
-              owner: st.owner,
-              type: st.type,
-              res: st.res,
-              fps: st.fps,
-              volume: 75,
-              muted: false,
-              minimized: false,
-              watching: !isStopped,
-              watchSession: 1,
-              isLocal: false
-            });
-          }
-        });
-
-        return [...localOnes, ...updatedRemotes];
-      });
-    });
-
-    socket.on('stream-started', (st) => {
-      if (st.senderId === socket.id) return;
-      stoppedWatchingSetRef.current.delete(st.streamId);
-
-      setStreams(prev => {
-        const exists = prev.find(s => s.id === st.streamId);
-        if (exists) {
-          return prev.map(s =>
-            s.id === st.streamId
-              ? { ...s, senderId: st.senderId, watching: true, minimized: false, watchSession: (s.watchSession || 0) + 1 }
-              : s
-          );
-        }
-        return [
-          ...prev,
-          {
-            id: st.streamId,
-            senderId: st.senderId,
-            owner: st.owner,
-            type: st.type,
-            res: st.res,
-            fps: st.fps,
-            volume: 75,
-            muted: false,
-            minimized: false,
-            watching: true,
-            watchSession: 1,
-            isLocal: false
-          }
-        ];
-      });
-      socket.emit('request-keyframe', { streamId: st.streamId });
-    });
-
-    socket.on('force-keyframe', () => {
-      Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
-    });
-
-    socket.on('v-chunk', (meta, buffer) => {
-      setStreams(prev => {
-        if (prev.some(s => s.id === meta.id)) return prev;
-        const isStopped = stoppedWatchingSetRef.current.has(meta.id);
-        return [
-          ...prev,
-          {
-            id: meta.id,
-            senderId: meta.senderId,
-            owner: meta.owner || 'Participante',
-            type: 'Tela',
-            res: `${meta.h}p`,
-            fps: meta.fps || 60,
-            volume: 75,
-            muted: false,
-            minimized: false,
-            watching: !isStopped,
-            watchSession: 1,
-            isLocal: false
-          }
-        ];
-      });
-
-      if (stoppedWatchingSetRef.current.has(meta.id)) return;
-      const handler = videoChunkHandlersRef.current[meta.id];
-      if (handler) handler(meta, buffer);
-    });
-
-    socket.on('a-chunk', (meta, buffer) => {
-      if (stoppedWatchingSetRef.current.has(meta.id)) return;
-      const handler = audioChunkHandlersRef.current[meta.id];
-      if (handler) handler(meta, buffer);
-    });
-
-    socket.on('peer-stopped-stream', ({ streamId }) => {
-      stoppedWatchingSetRef.current.delete(streamId);
-      clipManagersRef.current[streamId]?.destroy?.();
-      delete clipManagersRef.current[streamId];
-      setStreams(prev => prev.filter(s => s.id !== streamId));
-      delete videoChunkHandlersRef.current[streamId];
-      delete audioChunkHandlersRef.current[streamId];
-    });
-
-    socket.on('chat-message', (msg) => {
-      setMessages(prev => [...prev, msg]);
-    });
-
-    return () => {
-      Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
-      Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
-      if (myPeer) myPeer.destroy();
-      socket.disconnect();
-    };
-  }, [inRoom, roomName, roomPassword, nickname]);
-
+  // Envia também via WebCodecs pelo DataChannel P2P para garantir imagem mesmo se a chamada de mídia WebRTC sofrer bloqueio
   const startWebCodecsSender = async (streamId, mediaStream, isCamera = false) => {
     const vTrack = mediaStream.getVideoTracks()[0];
-    if (!vTrack) return;
+    if (!vTrack || !('VideoEncoder' in window)) return;
 
     let running = true;
     let forceKey = true;
@@ -556,16 +635,21 @@ export default function App() {
         const buf = new Uint8Array(chunk.byteLength);
         chunk.copyTo(buf);
 
-        socketRef.current?.emit('v-chunk', {
-          id: streamId,
-          owner: nickname,
-          c: currentCodecStr,
-          t: chunk.type,
-          ts: chunk.timestamp,
-          w: targetW,
-          h: targetH,
-          fps: fpsRef.current
-        }, buf.buffer);
+        broadcastPacket({
+          type: 'v-chunk',
+          meta: {
+            id: streamId,
+            senderId: peerRef.current?.id,
+            owner: nickname,
+            c: currentCodecStr,
+            t: chunk.type,
+            ts: chunk.timestamp,
+            w: targetW,
+            h: targetH,
+            fps: fpsRef.current
+          },
+          buffer: buf.buffer
+        });
       },
       error: () => {}
     });
@@ -600,13 +684,17 @@ export default function App() {
             if (!running) return;
             const buf = new Uint8Array(chunk.byteLength);
             chunk.copyTo(buf);
-            socketRef.current?.emit('a-chunk', {
-              id: streamId,
-              ts: chunk.timestamp,
-              sr: 48000,
-              ch: 2,
-              gain: outgoingVolumeRef.current
-            }, buf.buffer);
+            broadcastPacket({
+              type: 'a-chunk',
+              meta: {
+                id: streamId,
+                ts: chunk.timestamp,
+                sr: 48000,
+                ch: 2,
+                gain: outgoingVolumeRef.current
+              },
+              buffer: buf.buffer
+            });
           },
           error: () => {}
         });
@@ -637,14 +725,12 @@ export default function App() {
 
           const now = performance.now();
           const minInterval = 1000 / (Number(fpsRef.current) + 2);
-          const ws = socketRef.current?.io?.engine?.transport?.ws;
-          const netBusy = ws && ws.bufferedAmount > 250000;
 
           if (now - lastFrameTime < minInterval) {
             frame.close();
             continue;
           }
-          if (videoEncoder.encodeQueueSize > 2 || netBusy) {
+          if (videoEncoder.encodeQueueSize > 2) {
             droppedFrame = true;
             frame.close();
             continue;
@@ -653,7 +739,6 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              // Se descartou algum frame por gargalo de rede, gera Keyframe imediato para não travar em 1 FPS!
               const isKey = forceKey || droppedFrame || (frameCount % 60 === 0);
               forceKey = false;
               droppedFrame = false;
@@ -687,7 +772,6 @@ export default function App() {
       const cfg = RES_CONFIG[quality] || RES_CONFIG['1080p'];
       const targetFps = Number(fps);
 
-      // Usa windowAudio: 'window' quando a opção de isolar o Discord está ativa
       const mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: cfg.width, max: 2560 },
@@ -712,9 +796,10 @@ export default function App() {
       const newId = 'stream_' + Math.random().toString(36).substring(2, 9);
       vTrack.onended = () => stopStream(newId);
 
+      const selfId = peerRef.current?.id || 'local';
       const newStreamObj = {
         id: newId,
-        senderId: socketRef.current?.id,
+        senderId: selfId,
         owner: nickname,
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
@@ -731,33 +816,29 @@ export default function App() {
       localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
 
-      // Conecta via P2P Direto (PeerJS) para amigos na sala
-      if (peerRef.current) {
-        participantsRef.current.forEach(u => {
-          if (u.id !== socketRef.current?.id && u.peerId) {
-            try {
-              peerRef.current.call(u.peerId, mediaStream, {
-                metadata: {
-                  streamId: newId,
-                  senderId: socketRef.current?.id,
-                  owner: nickname,
-                  type: newStreamObj.type,
-                  res: cfg.label,
-                  fps: targetFps
-                }
-              });
-            } catch (e) {}
-          }
-        });
-      }
-
-      socketRef.current?.emit('start-stream', {
+      const streamMeta = {
         streamId: newId,
+        senderId: selfId,
         owner: nickname,
         type: newStreamObj.type,
         res: cfg.label,
         fps: targetFps
-      });
+      };
+
+      if (isHostRef.current) {
+        activeStreamsMapRef.current.set(newId, streamMeta);
+        syncRoomStateFromHost();
+      }
+      broadcastPacket({ type: 'start-stream', meta: streamMeta });
+
+      // Liga chamada WebRTC de vídeo direto para todos os participantes na sala
+      if (peerRef.current) {
+        dataConnsRef.current.forEach((_, pid) => {
+          try {
+            peerRef.current.call(pid, mediaStream, { metadata: streamMeta });
+          } catch (e) {}
+        });
+      }
 
       await startWebCodecsSender(newId, mediaStream, false);
     } catch (err) {}
@@ -773,9 +854,10 @@ export default function App() {
       const vTrack = mediaStream.getVideoTracks()[0];
       vTrack.onended = () => stopStream(newId);
 
+      const selfId = peerRef.current?.id || 'local';
       const newStreamObj = {
         id: newId,
-        senderId: socketRef.current?.id,
+        senderId: selfId,
         owner: nickname,
         type: 'Câmera',
         stream: mediaStream,
@@ -792,13 +874,28 @@ export default function App() {
       localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
 
-      socketRef.current?.emit('start-stream', {
+      const streamMeta = {
         streamId: newId,
+        senderId: selfId,
         owner: nickname,
         type: 'Câmera',
         res: '720p',
         fps: Number(fps)
-      });
+      };
+
+      if (isHostRef.current) {
+        activeStreamsMapRef.current.set(newId, streamMeta);
+        syncRoomStateFromHost();
+      }
+      broadcastPacket({ type: 'start-stream', meta: streamMeta });
+
+      if (peerRef.current) {
+        dataConnsRef.current.forEach((_, pid) => {
+          try {
+            peerRef.current.call(pid, mediaStream, { metadata: streamMeta });
+          } catch (e) {}
+        });
+      }
 
       await startWebCodecsSender(newId, mediaStream, true);
     } catch (err) {
@@ -819,7 +916,11 @@ export default function App() {
       return prev.filter(s => s.id !== streamId);
     });
 
-    socketRef.current?.emit('stop-stream', { streamId });
+    if (isHostRef.current) {
+      activeStreamsMapRef.current.delete(streamId);
+      syncRoomStateFromHost();
+    }
+    broadcastPacket({ type: 'stop-stream', streamId });
     if (expandedId === streamId) setExpandedId(null);
   };
 
@@ -862,10 +963,56 @@ export default function App() {
     }
   };
 
+  // Gera e baixa o Launcher Desktop Windows (.cmd) que NÃO sofre bloqueio de vírus no Chrome nem no Windows Defender
+  const downloadSafeDesktopApp = () => {
+    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
+    const targetUrl = `${window.location.origin}/?desktop=1&sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
+
+    const launcherScript = [
+      '@echo off',
+      'chcp 65001 >nul',
+      'title VogelsTV Desktop',
+      'set "APP_URL=' + targetUrl + '"',
+      'set "PROFILE_DIR=%LOCALAPPDATA%\\VogelsTV\\AppProfile"',
+      'if not exist "%PROFILE_DIR%" mkdir "%PROFILE_DIR%"',
+      '',
+      'set "BROWSER="',
+      'if exist "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe" set "BROWSER=%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe"',
+      'if exist "%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe" set "BROWSER=%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe"',
+      'if exist "%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe" set "BROWSER=%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"',
+      'if "%BROWSER%"=="" if exist "%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe" set "BROWSER=%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe"',
+      'if "%BROWSER%"=="" if exist "%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe" set "BROWSER=%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe"',
+      '',
+      'if not "%BROWSER%"=="" (',
+      '  start "" "%BROWSER%" --app="%APP_URL%" --user-data-dir="%PROFILE_DIR%" --enable-features=ApplicationAudioCaptureWin,AudioServiceOutOfProcess --autoplay-policy=no-user-gesture-required',
+      ') else (',
+      '  start "" "%APP_URL%"',
+      ')',
+      'exit'
+    ].join('\r\n');
+
+    const blob = new Blob([launcherScript], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'VogelsTV-Desktop.cmd';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
   const sendChat = (e) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
-    socketRef.current?.emit('chat-message', { text: chatInput.trim() });
+    const msgPayload = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sender: nickname,
+      text: chatInput.trim().slice(0, 500),
+      time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+    };
+    setMessages(prev => [...prev, msgPayload]);
+    broadcastPacket({ type: 'chat-message', msg: msgPayload });
     setChatInput('');
   };
 
@@ -960,8 +1107,8 @@ export default function App() {
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-200 px-2 py-0.5 rounded-full font-mono">
             {cleanRoom}
           </span>
-          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-300 px-2 py-0.5 rounded-full">
-            {participants.length} online
+          <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-emerald-400 px-2 py-0.5 rounded-full font-medium">
+            {Math.max(1, participants.length)} online
           </span>
         </div>
 
@@ -1126,7 +1273,7 @@ export default function App() {
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Ativado por padrão: captura o áudio da janela/jogo sem transmitir a voz do Discord para quem assiste.
+                    Ativado por padrão: isola o áudio da janela/jogo sem transmitir a voz do Discord para quem assiste.
                   </p>
                 </div>
 
@@ -1151,18 +1298,13 @@ export default function App() {
             )}
           </div>
 
-          {/* Download estático direto do arquivo /VogelsTV.exe + cópia automática do link da sala para o executável abrir direto nela */}
-          <a
-            href="/VogelsTV.exe"
-            download="VogelsTV.exe"
-            onClick={() => {
-              try { navigator.clipboard.writeText(currentRoomUrl); } catch (e) {}
-            }}
-            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer inline-flex items-center"
-            title="Baixar arquivo executável VogelsTV.exe"
+          <button
+            onClick={downloadSafeDesktopApp}
+            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer"
+            title="Baixar Launcher Desktop Oficial (Sem alerta do Chrome/Windows)"
           >
             Baixar app
-          </a>
+          </button>
 
           <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
             🔗 Link
@@ -1175,7 +1317,6 @@ export default function App() {
                 ? 'bg-red-600/25 border-red-500/60 text-red-200'
                 : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
             }`}
-            title={sidebarCollapsed ? 'Expandir Chat e Participantes' : 'Minimizar Chat e Participantes'}
           >
             <span>💬</span> {sidebarCollapsed ? 'Abrir Chat' : 'Ocultar Chat'}
           </button>
@@ -1225,7 +1366,7 @@ export default function App() {
                     key={`${streamObj.id}_${streamObj.watchSession || 1}`}
                     streamObj={streamObj}
                     masterVolume={masterVolume}
-                    socketRef={socketRef}
+                    onRequestKeyframe={() => broadcastPacket({ type: 'request-keyframe', streamId: streamObj.id })}
                     videoChunkHandlersRef={videoChunkHandlersRef}
                     audioChunkHandlersRef={audioChunkHandlersRef}
                     clipManagersRef={clipManagersRef}
@@ -1268,14 +1409,13 @@ export default function App() {
                 <button
                   onClick={() => setSidebarCollapsed(true)}
                   className="text-[10px] text-gray-400 hover:text-white bg-[#1B202B] px-1.5 py-0.5 rounded cursor-pointer"
-                  title="Minimizar painel lateral"
                 >
                   ❯ Minimizar
                 </button>
               </div>
               <div className="space-y-1.5">
                 {participants.map(p => {
-                  const isMe = p.id === socketRef.current?.id;
+                  const isMe = p.id === myPeerId;
                   const userStreams = streams.filter(
                     s => (s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)
                   );
@@ -1415,7 +1555,7 @@ export default function App() {
 function VideoTile({
   streamObj,
   masterVolume,
-  socketRef,
+  onRequestKeyframe,
   videoChunkHandlersRef,
   audioChunkHandlersRef,
   clipManagersRef,
@@ -1434,7 +1574,7 @@ function VideoTile({
   const remoteP2PVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
-  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0', mode: '' });
+  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
   const [p2pActive, setP2pActive] = useState(false);
 
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -1482,7 +1622,6 @@ function VideoTile({
     }
   }, [streamObj.muted, streamObj.volume, masterVolume]);
 
-  // Se o PeerJS P2P Direto conectar (usado no Cloudflare Pages), reproduz direto a 60 FPS sem passar pelo servidor!
   useEffect(() => {
     if (streamObj.isLocal || !streamObj.p2pStream || !remoteP2PVideoRef.current) return;
     const el = remoteP2PVideoRef.current;
@@ -1556,7 +1695,7 @@ function VideoTile({
         },
         error: () => {
           waitingForKey = true;
-          socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+          onRequestKeyframe?.();
         }
       });
 
@@ -1576,7 +1715,7 @@ function VideoTile({
         }
         if (waitingForKey) {
           if (meta.t !== 'key') {
-            socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+            onRequestKeyframe?.();
             return;
           }
           waitingForKey = false;
@@ -1591,7 +1730,7 @@ function VideoTile({
         decoder.decode(chunk);
       } catch (err) {
         waitingForKey = true;
-        socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+        onRequestKeyframe?.();
       }
     };
 
@@ -1695,16 +1834,16 @@ function VideoTile({
       }, 800);
     }
 
-    socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+    onRequestKeyframe?.();
     const keyframeRetryTimer = setInterval(() => {
       if (waitingForKey) {
-        socketRef.current?.emit('request-keyframe', { streamId: streamObj.id });
+        onRequestKeyframe?.();
       }
-    }, 400);
+    }, 500);
 
     const statTimer = setInterval(() => {
       const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
-      setStats({ w: currentW, h: currentH, fps: framesRendered, mbps, mode: 'Relay' });
+      setStats({ w: currentW, h: currentH, fps: framesRendered, mbps });
       framesRendered = 0;
       bytesCount = 0;
     }, 1000);
