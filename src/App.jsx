@@ -3,11 +3,10 @@ import { io } from 'socket.io-client';
 
 const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
 
-// Bitrates calibrados para 60 FPS lisos com ZERO bufferbloat (não aumenta o ping do jogo nem do Discord!)
 const RES_CONFIG = {
-  '720p': { width: 1280, height: 720, bitrate: 1500000, label: '720p' },
-  '1080p': { width: 1920, height: 1080, bitrate: 2500000, label: '1080p' },
-  '1440p': { width: 2560, height: 1440, bitrate: 3800000, label: '2K (1440p)' }
+  '720p': { width: 1280, height: 720, label: '720p' },
+  '1080p': { width: 1920, height: 1080, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, label: '2K (1440p)' }
 };
 
 function renderVogelsLogo(size = 'text-sm') {
@@ -61,17 +60,19 @@ function unpackBinaryFrame(arrayBuffer) {
   return { headerObj, payloadBuffer };
 }
 
-// Prioriza H.264 NVENC (Hardware GPU) para usar 0% de CPU ao codificar 60 FPS!
+// Prioriza H.264 High Profile Level 5.1 (avc1.640033 / NVENC CABAC) para 8000 kbps sem quadriculados!
 async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
   const w = Math.max(2, Math.floor(width / 2) * 2);
   const h = Math.max(2, Math.floor(height / 2) * 2);
 
   const candidates = [
-    preferredCodec === 'H264' ? { codec: 'avc1.42e01f', avc: { format: 'annexb' } } : null,
-    preferredCodec === 'H264' ? { codec: 'avc1.42002a', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'H264' ? { codec: 'avc1.640033', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'H264' ? { codec: 'avc1.64002a', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'H264' ? { codec: 'avc1.4d002a', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'VP9' ? { codec: 'vp09.00.41.08' } : null,
     preferredCodec === 'VP9' ? { codec: 'vp09.00.10.08' } : null,
-    { codec: 'avc1.42e01f', avc: { format: 'annexb' } },
-    { codec: 'vp8' }
+    { codec: 'vp8' },
+    { codec: 'avc1.42e01f', avc: { format: 'annexb' } }
   ].filter(Boolean);
 
   for (const hw of ['prefer-hardware', 'no-preference']) {
@@ -94,9 +95,8 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
   return { codec: 'vp8', width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
 }
 
-// Buffer de Replay de 30s em RAM (ZERO uso de CPU/GPU durante a transmissão! Guarda apenas os bytes já comprimidos)
 function createZeroCpuChunkBuffer() {
-  let chunks = []; // { t, ts, c, w, h, data: Uint8Array, arrivedAt }
+  let chunks = [];
 
   return {
     pushChunk: (meta, buffer) => {
@@ -114,9 +114,8 @@ function createZeroCpuChunkBuffer() {
         arrivedAt: now
       });
 
-      // Mantém apenas os últimos 32 segundos na memória RAM (~8 MB)
-      const cutoff = now - 32000;
-      if (chunks.length > 120 && chunks[0].arrivedAt < cutoff) {
+      const cutoff = now - 31000;
+      if (chunks.length > 180 && chunks[0].arrivedAt < cutoff) {
         let firstKeyIdx = 0;
         for (let i = 0; i < chunks.length; i++) {
           if (chunks[i].arrivedAt >= cutoff) break;
@@ -128,7 +127,6 @@ function createZeroCpuChunkBuffer() {
       }
     },
     getSnapshot: () => {
-      // Retorna a partir do primeiro Keyframe válido dos últimos 30 segundos
       const keyIdx = chunks.findIndex(c => c.t === 'key');
       if (keyIdx === -1) return [];
       return chunks.slice(keyIdx);
@@ -146,15 +144,15 @@ export default function App() {
   const [roomPassword, setRoomPassword] = useState('');
 
   const [quality, setQuality] = useState('1080p');
+  // Bitrate padrão em 8000 kbps (8 Mbps), igual ao OBS / salinha.live
+  const [bitrateKbps, setBitrateKbps] = useState(8000);
   const [sharpness, setSharpness] = useState('motion');
   const [fps, setFps] = useState(60);
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showMixer, setShowMixer] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-
-  // Modal de Replay (reproduz os chunks da RAM sob demanda usando 0% de CPU durante a live)
-  const [replayModal, setReplayModal] = useState(null); // { streamId, owner, chunks }
+  const [replayModal, setReplayModal] = useState(null);
 
   const [outgoingVolume, setOutgoingVolume] = useState(() => {
     const saved = localStorage.getItem('tv_out_vol');
@@ -173,9 +171,7 @@ export default function App() {
   const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
   const [discordIsolatedActive, setDiscordIsolatedActive] = useState(false);
 
-  // H264 NVENC por padrão para usar o chip dedicado da placa de vídeo sem pesar no processador!
   const [codec, setCodec] = useState('H264');
-  const [clipConfig, setClipConfig] = useState('720p');
 
   const [myId, setMyId] = useState('local-me');
   const myIdRef = useRef('local-me');
@@ -185,7 +181,7 @@ export default function App() {
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [messages, setMessages] = useState([
-    { id: 'sys-1', system: true, text: 'Sessão iniciada. O chat e as transmissões estão prontos!' }
+    { id: 'sys-1', system: true, text: 'Sessão iniciada em alta taxa de bits (8000 kbps). Mande o link para a galera!' }
   ]);
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef(null);
@@ -201,16 +197,16 @@ export default function App() {
   const activeEncodersRef = useRef({});
   const videoChunkHandlersRef = useRef({});
   const audioChunkHandlersRef = useRef({});
-  const ramClipBuffersRef = useRef({}); // streamId -> zeroCpuChunkBuffer
+  const ramClipBuffersRef = useRef({});
   const stoppedWatchingSetRef = useRef(new Set());
 
   const qualityRef = useRef(quality);
+  const bitrateKbpsRef = useRef(bitrateKbps);
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
   const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
 
-  // Rola o chat automaticamente para a última mensagem
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
@@ -244,10 +240,11 @@ export default function App() {
 
   useEffect(() => {
     qualityRef.current = quality;
+    bitrateKbpsRef.current = bitrateKbps;
     fpsRef.current = fps;
     codecRef.current = codec;
     Object.values(activeEncodersRef.current).forEach(enc => enc.reconfigure?.());
-  }, [quality, fps, codec]);
+  }, [quality, bitrateKbps, fps, codec]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -389,7 +386,6 @@ export default function App() {
 
       if (stoppedWatchingSetRef.current.has(meta.id)) return;
 
-      // Guarda na memória RAM para o Replay de 30s (Custo ZERO de CPU/GPU!)
       if (!ramClipBuffersRef.current[meta.id]) {
         ramClipBuffersRef.current[meta.id] = createZeroCpuChunkBuffer();
       }
@@ -424,7 +420,6 @@ export default function App() {
       });
     };
 
-    // Conecta 2 WebSockets separados na Cloudflare: 1 para Chat/Controle (zero fila) e 1 para Mídia Binária
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const controlUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=control`;
     const mediaUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=media`;
@@ -445,14 +440,14 @@ export default function App() {
               controlWs.send(JSON.stringify({ type, ...payload }));
             }
           },
+          // IMPORTANTE: Nunca descarta um frame DEPOIS do encoder (para não quebrar a cadeia de P-frames)!
           sendVideoChunk: (meta, buffer) => {
-            // Limite estrito de 64KB no buffer de envio: impede 100% que o ping (ms) suba!
-            if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 65536) {
+            if (mediaWs && mediaWs.readyState === 1) {
               mediaWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
             }
           },
           sendAudioChunk: (meta, buffer) => {
-            if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 65536) {
+            if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 524288) {
               mediaWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
             }
           },
@@ -525,16 +520,10 @@ export default function App() {
           socket.emit(type, payload);
         },
         sendVideoChunk: (meta, buffer) => {
-          const wsBuffer = socket.io?.engine?.transport?.ws?.bufferedAmount || 0;
-          if (wsBuffer < 65536) {
-            socket.emit('v-chunk', meta, buffer);
-          }
+          socket.emit('v-chunk', meta, buffer);
         },
         sendAudioChunk: (meta, buffer) => {
-          const wsBuffer = socket.io?.engine?.transport?.ws?.bufferedAmount || 0;
-          if (wsBuffer < 65536) {
-            socket.emit('a-chunk', meta, buffer);
-          }
+          socket.emit('a-chunk', meta, buffer);
         },
         getBufferedAmount: () => socket.io?.engine?.transport?.ws?.bufferedAmount || 0
       };
@@ -636,6 +625,7 @@ export default function App() {
 
     let running = true;
     let forceKey = true;
+    let lastKeyframeTs = 0;
     let frameCount = 0;
     let currentCodecStr = 'vp8';
     let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
@@ -671,11 +661,12 @@ export default function App() {
     const configureEncoderNow = async (rawW, rawH) => {
       const cfg = RES_CONFIG[qualityRef.current] || RES_CONFIG['1080p'];
       const targetFps = Number(fpsRef.current) || 60;
+      const targetBitrateBps = (Number(bitrateKbpsRef.current) || 8000) * 1000;
       const ratio = rawW && rawH ? rawW / rawH : 16 / 9;
       targetH = Math.min(cfg.height, rawH || cfg.height);
       targetW = Math.round(targetH * ratio);
 
-      const bestCfg = await findSupportedVideoConfig(targetW, targetH, targetFps, cfg.bitrate, codecRef.current);
+      const bestCfg = await findSupportedVideoConfig(targetW, targetH, targetFps, targetBitrateBps, codecRef.current);
       currentCodecStr = bestCfg.codec;
       targetW = bestCfg.width;
       targetH = bestCfg.height;
@@ -707,8 +698,7 @@ export default function App() {
           },
           error: () => {}
         });
-        // Envia pacotes de áudio otimizados (64 kbps Opus) para não sobrecarregar o roteador
-        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 64000 });
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 96000 });
 
         let usingDesktopWasapi = false;
         try {
@@ -728,7 +718,6 @@ export default function App() {
 
             const reader = response.body.getReader();
             let leftover = new Uint8Array(0);
-            // Agrupa 40ms de áudio por pacote (1920 frames = 7680 bytes) reduzindo pela metade o número de pacotes na rede!
             const frameBytes = 1920 * 4;
             let timestampUs = 0;
 
@@ -746,7 +735,7 @@ export default function App() {
                   const slice = combined.subarray(offset, offset + frameBytes);
                   offset += frameBytes;
 
-                  if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 2) {
+                  if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 3) {
                     const ad = new AudioData({
                       format: 's16',
                       sampleRate: 48000,
@@ -775,7 +764,7 @@ export default function App() {
               while (running) {
                 const { value: aData, done } = await aReader.read();
                 if (done || !aData) break;
-                if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 2) {
+                if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 3) {
                   audioEncoder.encode(aData);
                 }
                 aData.close();
@@ -792,22 +781,17 @@ export default function App() {
 
       (async () => {
         let lastFrameTime = 0;
-        let droppedFrame = false;
         while (running) {
           const { value: frame, done } = await reader.read();
           if (done || !frame) break;
 
           const now = performance.now();
-          const minInterval = 1000 / (Number(fpsRef.current) + 1);
-          // Controle estrito de 64KB para nunca aumentar o Ping nem travar a GPU
-          const netBusy = transportRef.current.getBufferedAmount() > 65536;
+          const minInterval = 1000 / (Number(fpsRef.current) + 2);
+          // Permite até 1.5 MB de rajada para comportar Keyframes de 8000–12000 kbps sem cortar frames!
+          const netBusy = transportRef.current.getBufferedAmount() > 1572864;
 
-          if (now - lastFrameTime < minInterval) {
-            frame.close();
-            continue;
-          }
-          if (videoEncoder.encodeQueueSize > 1 || netBusy) {
-            droppedFrame = true;
+          if (now - lastFrameTime < minInterval || videoEncoder.encodeQueueSize > 3 || netBusy) {
+            // Pular um frame ANTES do encoder NÃO corrompe a referência P-frame! Nunca forçar Keyframe aqui!
             frame.close();
             continue;
           }
@@ -815,9 +799,12 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              const isKey = forceKey || droppedFrame || (frameCount % 90 === 0);
-              forceKey = false;
-              droppedFrame = false;
+              // Keyframe apenas a cada 180 frames (3s em 60fps) ou quando solicitado com cooldown de 1.5s
+              const isKey = forceKey || (frameCount % 180 === 0);
+              if (isKey) {
+                forceKey = false;
+                lastKeyframeTs = now;
+              }
               videoEncoder.encode(frame, { keyFrame: isKey });
               frameCount++;
             }
@@ -830,7 +817,12 @@ export default function App() {
     }
 
     activeEncodersRef.current[streamId] = {
-      forceKey: () => { forceKey = true; },
+      forceKey: () => {
+        const now = performance.now();
+        if (now - lastKeyframeTs > 1200) {
+          forceKey = true;
+        }
+      },
       reconfigure: () => {
         const st = vTrack.getSettings ? vTrack.getSettings() : {};
         configureEncoderNow(st.width || 1920, st.height || 1080);
@@ -973,7 +965,6 @@ export default function App() {
     if (expandedId === streamId) setExpandedId(null);
   };
 
-  // Abre o Replay instantâneo direto dos chunks em RAM (ou exporta o arquivo WebM sob demanda)
   const handleReplayOrClip = (targetStreamId) => {
     const targetStream = streams.find(s => s.id === targetStreamId) || streams.find(s => s.watching !== false);
     if (!targetStream) {
@@ -995,7 +986,6 @@ export default function App() {
     });
   };
 
-  // Chat 100% funcional com renderização otimista imediata + envio no canal de controle
   const sendChat = (e) => {
     e.preventDefault();
     const cleanText = chatInput.trim();
@@ -1008,9 +998,7 @@ export default function App() {
       time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
     };
 
-    // Mostra na tela imediatamente para quem digitou
     setMessages(prev => [...prev, msgPayload]);
-    // Envia para todos na sala pelo canal de controle
     transportRef.current.sendControl('chat-message', { text: cleanText, msg: msgPayload });
     setChatInput('');
   };
@@ -1123,14 +1111,22 @@ export default function App() {
 
         <div className="flex items-center gap-1.5 flex-wrap">
           <select value={quality} onChange={e => setQuality(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            <option value="720p">Qualidade: 720p (HD · Leve)</option>
-            <option value="1080p">Qualidade: 1080p (Full HD)</option>
-            <option value="1440p">Qualidade: 2K (1440p)</option>
+            <option value="720p">720p (HD)</option>
+            <option value="1080p">1080p (Full HD)</option>
+            <option value="1440p">2K (1440p)</option>
           </select>
 
-          <select value={sharpness} onChange={e => setSharpness(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            <option value="motion">Fluidez Máxima (Jogos / Vídeo)</option>
-            <option value="detail">Nitidez (Texto / Código)</option>
+          {/* Seletor de Bitrate Direto (Padrão 8000 kbps igual OBS / salinha.live) */}
+          <select
+            value={bitrateKbps}
+            onChange={e => setBitrateKbps(Number(e.target.value))}
+            className="bg-[#171B24] border border-red-500/40 text-xs text-red-300 font-semibold rounded-md px-2.5 py-1.5 cursor-pointer"
+            title="Taxa de Bits da Transmissão (Bitrate)"
+          >
+            <option value={4000}>4000 kbps (4 Mbps)</option>
+            <option value={6000}>6000 kbps (6 Mbps)</option>
+            <option value={8000}>8000 kbps (8K Bitrate · OBS)</option>
+            <option value={12000}>12000 kbps (12 Mbps Ultra)</option>
           </select>
 
           <select value={fps} onChange={e => setFps(Number(e.target.value))} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
@@ -1289,9 +1285,9 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (Placa de Vídeo)</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="H264">H.264 NVENC / Hardware (Zero Lag de CPU)</option>
+                    <option value="H264">H.264 High Profile (NVENC · 8000 kbps)</option>
+                    <option value="VP9">VP9 Alta Nitidez</option>
                     <option value="VP8">VP8 Rápido</option>
-                    <option value="VP9">VP9 Alta Definição</option>
                   </select>
                 </div>
               </div>
@@ -1465,7 +1461,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* PAINEL DE CHAT 100% FUNCIONAL E SELECIONÁVEL */}
             <div className="flex-1 flex flex-col p-3 overflow-hidden select-text">
               <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2 select-none">CHAT</h3>
               <div className="flex-1 bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 overflow-y-auto space-y-2 text-xs">
@@ -1515,7 +1510,6 @@ export default function App() {
   );
 }
 
-// Reprodutor e Exportador de Replay de 30s (Só usa a placa de vídeo no momento em que o modal é aberto!)
 function ReplayPlayerModal({ replayModal, watchingStreams, onSelectStream, onClose }) {
   const canvasRef = useRef(null);
   const [exporting, setExporting] = useState(false);
@@ -1601,7 +1595,7 @@ function ReplayPlayerModal({ replayModal, watchingStreams, onSelectStream, onClo
     const durationMs = Math.min(30000, Math.max(2000, chunks[chunks.length - 1].arrivedAt - chunks[0].arrivedAt));
     const stream = canvas.captureStream(30);
     const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
-    const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 3500000 });
+    const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 6000000 });
     const parts = [];
 
     rec.ondataavailable = (e) => {
@@ -1691,7 +1685,7 @@ function VideoTile({
   const localVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
-  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
+  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, kbps: 0 });
 
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimerRef = useRef(null);
@@ -1733,14 +1727,13 @@ function VideoTile({
     }
   }, [streamObj.muted, streamObj.volume, masterVolume]);
 
-  // Na transmissão local, apenas exibe o preview leve sem NENHUM MediaRecorder rodando!
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
     localVideoRef.current.srcObject = streamObj.stream;
     localVideoRef.current.play().catch(() => {});
   }, [streamObj.isLocal, streamObj.stream]);
 
-  // Na transmissão remota, usa requestAnimationFrame coalescing + desynchronized:true para 60 FPS lisos sem travar a UI
+  // Decodificador Remoto Contínuo (Sem reset de decodeQueueSize > 3 que causava engasgos!)
   useEffect(() => {
     if (streamObj.isLocal) return;
 
@@ -1751,30 +1744,19 @@ function VideoTile({
     let decoder = null;
     let configuredCodec = null;
     let waitingForKey = true;
+    let lastKeyReqTime = 0;
     let framesRendered = 0;
     let bytesCount = 0;
     let currentW = 1920;
     let currentH = 1080;
-    let pendingFrame = null;
-    let rafId = null;
 
-    const renderLoop = () => {
-      if (pendingFrame) {
-        const f = pendingFrame;
-        pendingFrame = null;
-        if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
-          canvas.width = f.displayWidth;
-          canvas.height = f.displayHeight;
-        }
-        currentW = f.displayWidth;
-        currentH = f.displayHeight;
-        ctx.drawImage(f, 0, 0);
-        f.close();
-        framesRendered++;
+    const requestKeyThrottled = () => {
+      const now = Date.now();
+      if (now - lastKeyReqTime > 1200) {
+        lastKeyReqTime = now;
+        onRequestKeyframe?.();
       }
-      rafId = requestAnimationFrame(renderLoop);
     };
-    rafId = requestAnimationFrame(renderLoop);
 
     const initDecoder = (codecStr) => {
       try {
@@ -1783,21 +1765,25 @@ function VideoTile({
 
       decoder = new VideoDecoder({
         output: (frame) => {
-          // Se já havia um frame esperando o próximo refresh do monitor, fecha o antigo imediatamente para nunca acumular fila!
-          if (pendingFrame) {
-            pendingFrame.close();
+          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+            canvas.width = frame.displayWidth;
+            canvas.height = frame.displayHeight;
           }
-          pendingFrame = frame;
+          currentW = frame.displayWidth;
+          currentH = frame.displayHeight;
+          ctx.drawImage(frame, 0, 0);
+          frame.close();
+          framesRendered++;
         },
         error: () => {
           waitingForKey = true;
-          onRequestKeyframe?.();
+          requestKeyThrottled();
         }
       });
 
       const cfg = codecStr.startsWith('avc1')
-        ? { codec: codecStr, avc: { format: 'annexb' }, optimizeForLatency: true }
-        : { codec: codecStr, optimizeForLatency: true };
+        ? { codec: codecStr, avc: { format: 'annexb' }, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' }
+        : { codec: codecStr, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' };
 
       decoder.configure(cfg);
       configuredCodec = codecStr;
@@ -1811,15 +1797,10 @@ function VideoTile({
         }
         if (waitingForKey) {
           if (meta.t !== 'key') {
-            onRequestKeyframe?.();
+            requestKeyThrottled();
             return;
           }
           waitingForKey = false;
-        }
-        if (decoder.decodeQueueSize > 3) {
-          waitingForKey = true;
-          onRequestKeyframe?.();
-          return;
         }
         const uint8 = new Uint8Array(buffer);
         bytesCount += uint8.byteLength;
@@ -1831,7 +1812,7 @@ function VideoTile({
         decoder.decode(chunk);
       } catch (err) {
         waitingForKey = true;
-        onRequestKeyframe?.();
+        requestKeyThrottled();
       }
     };
 
@@ -1910,7 +1891,7 @@ function VideoTile({
           if (meta && typeof meta.gain === 'number') {
             senderGainFactor = Math.max(0, Math.min(1, meta.gain / 100));
           }
-          if (audioDecoder.state === 'configured' && audioDecoder.decodeQueueSize < 3) {
+          if (audioDecoder.state === 'configured' && audioDecoder.decodeQueueSize < 5) {
             try {
               audioDecoder.decode(new EncodedAudioChunk({
                 type: 'key',
@@ -1926,22 +1907,18 @@ function VideoTile({
     onRequestKeyframe?.();
     const keyframeRetryTimer = setInterval(() => {
       if (waitingForKey) {
-        onRequestKeyframe?.();
+        requestKeyThrottled();
       }
-    }, 450);
+    }, 800);
 
     const statTimer = setInterval(() => {
-      const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
-      setStats({ w: currentW, h: currentH, fps: framesRendered, mbps });
+      const kbps = Math.round((bytesCount * 8) / 1000);
+      setStats({ w: currentW, h: currentH, fps: framesRendered, kbps });
       framesRendered = 0;
       bytesCount = 0;
     }, 1000);
 
     return () => {
-      if (rafId) cancelAnimationFrame(rafId);
-      if (pendingFrame) {
-        try { pendingFrame.close(); } catch (e) {}
-      }
       clearInterval(keyframeRetryTimer);
       clearInterval(statTimer);
       delete videoChunkHandlersRef.current[streamObj.id];
@@ -1988,7 +1965,7 @@ function VideoTile({
         <span className="text-emerald-300 font-mono text-[11px]">
           {streamObj.isLocal
             ? `· ${streamObj.res} · ${streamObj.fps} FPS · Local`
-            : `· ${stats.h ? stats.h + 'p' : streamObj.res} · ${stats.fps} FPS · ${stats.mbps} Mbps`}
+            : `· ${stats.h ? stats.h + 'p' : streamObj.res} · ${stats.fps} FPS · ${stats.kbps} kbps`}
         </span>
       </div>
 
