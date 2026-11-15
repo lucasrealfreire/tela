@@ -9,7 +9,7 @@ const RES_CONFIG = {
   '1440p': { width: 2560, height: 1440, bitrate: 8500000, label: '2K (1440p)' }
 };
 
-function VogelsLogo({ size = 'text-sm' }) {
+function renderVogelsLogo(size = 'text-sm') {
   return (
     <span className={`inline-flex items-center gap-1.5 font-extrabold tracking-tight select-none ${size}`}>
       <img src="/favicon.svg" alt="VTV" className="w-5 h-5 rounded-sm" />
@@ -200,7 +200,6 @@ export default function App() {
     return saved !== null ? Number(saved) : 80;
   });
 
-  // ATIVADO POR PADRÃO: Exclui o áudio do Discord na transmissão (para ninguém ouvir o Discord na sua live, sem mutar para você!)
   const [excludeDiscordAudio, setExcludeDiscordAudio] = useState(() => {
     const saved = localStorage.getItem('tv_exclude_discord');
     return saved !== null ? saved === 'true' : true;
@@ -213,7 +212,6 @@ export default function App() {
 
   const [myId, setMyId] = useState('local-me');
   const myIdRef = useRef('local-me');
-  // Guarda todos os IDs de stream criados localmente para NUNCA duplicar como se fossem remotos!
   const localStreamIdsRef = useRef(new Set());
 
   const [streams, setStreams] = useState([]);
@@ -246,7 +244,6 @@ export default function App() {
   const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
 
-  // Detecta automaticamente se o VogelsTV.exe (ponte WASAPI Anti-Eco do Discord) está aberto no Windows
   useEffect(() => {
     const checkBridge = async () => {
       try {
@@ -306,7 +303,6 @@ export default function App() {
       setParticipants(list && list.length ? list : [{ id: 'local-me', nick: nickname }]);
     };
 
-    // CORREÇÃO DA DUPLICAÇÃO DE TELA: Filtra estritamente streams locais (via myIdRef e localStreamIdsRef)
     const onActiveStreams = (list) => {
       if (isUnmounted || !Array.isArray(list)) return;
       setStreams(prev => {
@@ -316,7 +312,6 @@ export default function App() {
 
         list.forEach(st => {
           if (!st || !st.streamId) return;
-          // NUNCA duplica uma tela que pertence a nós mesmos!
           if (
             st.senderId === myIdRef.current ||
             localStreamIdsRef.current.has(st.streamId) ||
@@ -697,8 +692,6 @@ export default function App() {
     const settings = vTrack.getSettings ? vTrack.getSettings() : {};
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
-    // PIPELINE DE ÁUDIO COM ISOLAMENTO DO DISCORD POR PADRÃO:
-    // Se o App Desktop VogelsTV.exe estiver rodando, usa o stream WASAPI que exclui a árvore do Discord.exe da transmissão!
     let audioEncoder = null;
     if (!isCamera && 'AudioEncoder' in window) {
       try {
@@ -730,7 +723,6 @@ export default function App() {
             setDesktopBridgeActive(true);
             setDiscordIsolatedActive(excludeDiscordRef.current);
 
-            // Desativa a trilha de áudio bruta da tela para que o áudio do Discord NÃO vaze na transmissão!
             mediaStream.getAudioTracks().forEach(t => {
               t.enabled = false;
               t.stop();
@@ -775,7 +767,6 @@ export default function App() {
           }
         } catch (e) {}
 
-        // Fallback caso o usuário esteja apenas no navegador sem o VogelsTV.exe aberto
         if (!usingDesktopWasapi) {
           const aTrack = mediaStream.getAudioTracks()[0];
           if (aTrack && 'MediaStreamTrackProcessor' in window) {
@@ -854,7 +845,6 @@ export default function App() {
 
   const handleShareScreen = async () => {
     try {
-      // Se já houver um compartilhamento de tela local aberto, encerra-o antes para nunca duplicar
       streams.filter(s => s.isLocal && s.type !== 'Câmera').forEach(s => stopStream(s.id));
 
       const cfg = RES_CONFIG[quality] || RES_CONFIG['1080p'];
@@ -1050,7 +1040,7 @@ export default function App() {
       <div className="h-screen w-screen bg-[#0D0F13] flex items-center justify-center p-4">
         <div className="w-full max-w-sm bg-[#151922] border border-[#232936] rounded-xl p-6 shadow-2xl">
           <div className="flex items-center justify-between mb-6">
-            <VogelsLogo size="text-2xl"/>
+            {renderVogelsLogo('text-2xl')}
             {desktopBridgeActive && (
               <span className="text-[11px] bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 px-2 py-0.5 rounded font-medium">
                 App Windows Ativo
@@ -1128,7 +1118,7 @@ export default function App() {
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
       <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20">
         <div className="flex items-center gap-2">
-          <VogelsLogo size="text-base"/>
+          {renderVogelsLogo('text-base')}
           <span className="text-amber-400 text-xs">🔒</span>
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-200 px-2 py-0.5 rounded-full font-mono">
             {cleanRoom}
@@ -1137,7 +1127,7 @@ export default function App() {
             {participants.length} online
           </span>
           {discordIsolatedActive && (
-            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full" title="Você ouve o Discord normalmente, mas a voz do Discord não sai na sua transmissão">
+            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full">
               🛡️ Discord Isolado na Live
             </span>
           )}
@@ -1367,7 +1357,7 @@ export default function App() {
           {watchingStreams.length === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3">
               {unwatchedStreams.length > 0 ? (
-                <>
+                <div className="space-y-3">
                   <p className="text-xs text-gray-300">
                     Há {unwatchedStreams.length} transmissão(ões) ativa(s) na sala que você parou de assistir.
                   </p>
@@ -1382,7 +1372,7 @@ export default function App() {
                       </button>
                     ))}
                   </div>
-                </>
+                </div>
               ) : (
                 <div>
                   <p className="text-xs text-gray-400">Ninguém está compartilhando ainda.</p>
@@ -1396,23 +1386,27 @@ export default function App() {
             <div className={`flex-1 grid gap-3 overflow-hidden ${expandedId || watchingStreams.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
               {watchingStreams
                 .filter(s => !expandedId || s.id === expandedId)
-                .map(streamObj => (
-                  <VideoTile 1}`} key="{`${streamObj.id}_${streamObj.watchSession" masterVolume="{masterVolume}" onRequestKeyframe="{()" streamObj="{streamObj}" ||> transportRef.current.sendControl('request-keyframe', { streamId: streamObj.id })}
-                    videoChunkHandlersRef={videoChunkHandlersRef}
-                    audioChunkHandlersRef={audioChunkHandlersRef}
-                    clipManagersRef={clipManagersRef}
-                    clipConfig={clipConfig}
-                    onStop={() => stopStream(streamObj.id)}
-                    onStopWatching={() => setWatchingStream(streamObj.id, false)}
-                    onMute={() => toggleStreamMute(streamObj.id)}
-                    onVolumeChange={(val) => setStreamVolume(streamObj.id, val)}
-                    onMinimize={() => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s))}
-                    onExpand={() => setExpandedId(expandedId === streamObj.id ? null : streamObj.id)}
-                    isExpanded={expandedId === streamObj.id}
-                    onClip={() => handleReplayOrClip(streamObj.id, false)}
-                    onReplay={() => handleReplayOrClip(streamObj.id, true)}
-                  />
-                ))}
+                .map(streamObj =>
+                  React.createElement(VideoTile, {
+                    key: `${streamObj.id}_${streamObj.watchSession || 1}`,
+                    streamObj,
+                    masterVolume,
+                    onRequestKeyframe: () => transportRef.current.sendControl('request-keyframe', { streamId: streamObj.id }),
+                    videoChunkHandlersRef,
+                    audioChunkHandlersRef,
+                    clipManagersRef,
+                    clipConfig,
+                    onStop: () => stopStream(streamObj.id),
+                    onStopWatching: () => setWatchingStream(streamObj.id, false),
+                    onMute: () => toggleStreamMute(streamObj.id),
+                    onVolumeChange: (val) => setStreamVolume(streamObj.id, val),
+                    onMinimize: () => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s)),
+                    onExpand: () => setExpandedId(expandedId === streamObj.id ? null : streamObj.id),
+                    isExpanded: expandedId === streamObj.id,
+                    onClip: () => handleReplayOrClip(streamObj.id, false),
+                    onReplay: () => handleReplayOrClip(streamObj.id, true)
+                  })
+                )}
             </div>
           )}
 
@@ -1428,7 +1422,7 @@ export default function App() {
           )}
 
           <div className="absolute bottom-1.5 left-3 text-[11px] opacity-60 pointer-events-none">
-            <VogelsLogo size="text-xs"/>
+            {renderVogelsLogo('text-xs')}
           </div>
         </main>
 

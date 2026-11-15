@@ -44,7 +44,7 @@ const activeStreams = new Map();
 io.on('connection', (socket) => {
   let currentRoom = null;
 
-  socket.on('join-room', ({ roomName, roomPassword, nickname, peerId }) => {
+  socket.on('join-room', ({ roomName, roomPassword, nickname }) => {
     const cleanRoom = normalizeRoomKey(roomName, roomPassword);
     const cleanNick = String(nickname || 'usuario').trim().slice(0, 24);
 
@@ -61,8 +61,7 @@ io.on('connection', (socket) => {
     const roomUsers = rooms.get(cleanRoom);
     roomUsers.set(socket.id, {
       id: socket.id,
-      nick: cleanNick,
-      peerId: peerId || null
+      nick: cleanNick
     });
 
     io.to(cleanRoom).emit('room-users', Array.from(roomUsers.values()));
@@ -76,13 +75,18 @@ io.on('connection', (socket) => {
 
   socket.on('start-stream', (meta) => {
     if (!currentRoom || !activeStreams.has(currentRoom)) return;
+    const roomStreams = activeStreams.get(currentRoom);
+    for (const [sId, sMeta] of roomStreams.entries()) {
+      if (sMeta.senderId === socket.id) {
+        roomStreams.delete(sId);
+      }
+    }
     const streamData = { ...meta, senderId: socket.id };
-    activeStreams.get(currentRoom).set(meta.streamId, streamData);
-    io.to(currentRoom).emit('active-streams', Array.from(activeStreams.get(currentRoom).values()));
+    roomStreams.set(meta.streamId, streamData);
+    io.to(currentRoom).emit('active-streams', Array.from(roomStreams.values()));
     socket.to(currentRoom).emit('stream-started', streamData);
   });
 
-  // Usa volatile para NUNCA acumular fila TCP no servidor gratuito
   socket.on('v-chunk', (meta, buffer) => {
     if (currentRoom) {
       if (meta.t === 'key') {
