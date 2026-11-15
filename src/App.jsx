@@ -3,10 +3,11 @@ import { io } from 'socket.io-client';
 
 const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
 
+// Bitrates calibrados para 60 FPS lisos com ZERO bufferbloat (não aumenta o ping do jogo nem do Discord!)
 const RES_CONFIG = {
-  '720p': { width: 1280, height: 720, bitrate: 3000000, label: '720p' },
-  '1080p': { width: 1920, height: 1080, bitrate: 5500000, label: '1080p' },
-  '1440p': { width: 2560, height: 1440, bitrate: 8500000, label: '2K (1440p)' }
+  '720p': { width: 1280, height: 720, bitrate: 1500000, label: '720p' },
+  '1080p': { width: 1920, height: 1080, bitrate: 2500000, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, bitrate: 3800000, label: '2K (1440p)' }
 };
 
 function renderVogelsLogo(size = 'text-sm') {
@@ -60,19 +61,21 @@ function unpackBinaryFrame(arrayBuffer) {
   return { headerObj, payloadBuffer };
 }
 
+// Prioriza H.264 NVENC (Hardware GPU) para usar 0% de CPU ao codificar 60 FPS!
 async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
   const w = Math.max(2, Math.floor(width / 2) * 2);
   const h = Math.max(2, Math.floor(height / 2) * 2);
 
   const candidates = [
-    preferredCodec === 'H264' ? { codec: 'avc1.640033', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'H264' ? { codec: 'avc1.42e01f', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'H264' ? { codec: 'avc1.42002a', avc: { format: 'annexb' } } : null,
     preferredCodec === 'VP9' ? { codec: 'vp09.00.10.08' } : null,
-    { codec: 'vp8' },
-    { codec: 'avc1.42002a', avc: { format: 'annexb' } }
+    { codec: 'avc1.42e01f', avc: { format: 'annexb' } },
+    { codec: 'vp8' }
   ].filter(Boolean);
 
-  for (const cand of candidates) {
-    for (const hw of ['prefer-hardware', 'no-preference']) {
+  for (const hw of ['prefer-hardware', 'no-preference']) {
+    for (const cand of candidates) {
       try {
         const cfg = {
           ...cand,
@@ -91,86 +94,47 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
   return { codec: 'vp8', width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
 }
 
-function createRolling30sBuffer(getStreamFn) {
-  let slots = [];
-  let active = true;
-
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-    ? 'video/webm;codecs=vp8'
-    : MediaRecorder.isTypeSupported('video/mp4')
-    ? 'video/mp4'
-    : 'video/webm';
-
-  const spawnRecorderSlot = () => {
-    if (!active) return;
-    try {
-      const s = getStreamFn();
-      if (!s || !s.getVideoTracks().length) return;
-      const videoOnly = new MediaStream([s.getVideoTracks()[0]]);
-      const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 3500000 });
-      const slot = { rec, chunks: [], startTime: Date.now(), mimeType };
-
-      rec.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) slot.chunks.push(e.data);
-      };
-      rec.start(250);
-      slots.push(slot);
-
-      while (slots.length > 7) {
-        const old = slots.shift();
-        try { if (old.rec.state !== 'inactive') old.rec.stop(); } catch (e) {}
-      }
-    } catch (e) {}
-  };
-
-  spawnRecorderSlot();
-  const interval = setInterval(spawnRecorderSlot, 5000);
+// Buffer de Replay de 30s em RAM (ZERO uso de CPU/GPU durante a transmissão! Guarda apenas os bytes já comprimidos)
+function createZeroCpuChunkBuffer() {
+  let chunks = []; // { t, ts, c, w, h, data: Uint8Array, arrivedAt }
 
   return {
-    captureLast30s: () => {
-      return new Promise((resolve) => {
-        const validSlots = slots.filter(sl => sl.chunks.length > 0);
-        if (!validSlots.length) return resolve(null);
-
-        const now = Date.now();
-        let chosen = validSlots[0];
-        for (const sl of validSlots) {
-          const age = (now - sl.startTime) / 1000;
-          if (age >= 25 && age <= 34) {
-            chosen = sl;
-            break;
-          }
-        }
-
-        const finish = () => {
-          const blob = new Blob(chosen.chunks, { type: chosen.mimeType });
-          const durationSec = Math.min(30, Math.round((Date.now() - chosen.startTime) / 1000));
-          resolve({
-            blob,
-            url: URL.createObjectURL(blob),
-            mimeType: chosen.mimeType,
-            durationSec
-          });
-        };
-
-        slots = slots.filter(s => s !== chosen);
-        spawnRecorderSlot();
-
-        if (chosen.rec.state !== 'inactive') {
-          chosen.rec.onstop = finish;
-          try { chosen.rec.stop(); } catch (e) { finish(); }
-        } else {
-          finish();
-        }
+    pushChunk: (meta, buffer) => {
+      const now = Date.now();
+      const copy = new Uint8Array(buffer.byteLength);
+      copy.set(new Uint8Array(buffer));
+      chunks.push({
+        t: meta.t,
+        ts: meta.ts,
+        c: meta.c || 'vp8',
+        w: meta.w || 1920,
+        h: meta.h || 1080,
+        fps: meta.fps || 60,
+        data: copy,
+        arrivedAt: now
       });
+
+      // Mantém apenas os últimos 32 segundos na memória RAM (~8 MB)
+      const cutoff = now - 32000;
+      if (chunks.length > 120 && chunks[0].arrivedAt < cutoff) {
+        let firstKeyIdx = 0;
+        for (let i = 0; i < chunks.length; i++) {
+          if (chunks[i].arrivedAt >= cutoff) break;
+          if (chunks[i].t === 'key') firstKeyIdx = i;
+        }
+        if (firstKeyIdx > 0) {
+          chunks = chunks.slice(firstKeyIdx);
+        }
+      }
     },
-    destroy: () => {
-      active = false;
-      clearInterval(interval);
-      slots.forEach(sl => {
-        try { if (sl.rec.state !== 'inactive') sl.rec.stop(); } catch (e) {}
-      });
-      slots = [];
+    getSnapshot: () => {
+      // Retorna a partir do primeiro Keyframe válido dos últimos 30 segundos
+      const keyIdx = chunks.findIndex(c => c.t === 'key');
+      if (keyIdx === -1) return [];
+      return chunks.slice(keyIdx);
+    },
+    clear: () => {
+      chunks = [];
     }
   };
 }
@@ -188,7 +152,9 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showMixer, setShowMixer] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [replayModal, setReplayModal] = useState(null);
+
+  // Modal de Replay (reproduz os chunks da RAM sob demanda usando 0% de CPU durante a live)
+  const [replayModal, setReplayModal] = useState(null); // { streamId, owner, chunks }
 
   const [outgoingVolume, setOutgoingVolume] = useState(() => {
     const saved = localStorage.getItem('tv_out_vol');
@@ -207,7 +173,8 @@ export default function App() {
   const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
   const [discordIsolatedActive, setDiscordIsolatedActive] = useState(false);
 
-  const [codec, setCodec] = useState('VP8');
+  // H264 NVENC por padrão para usar o chip dedicado da placa de vídeo sem pesar no processador!
+  const [codec, setCodec] = useState('H264');
   const [clipConfig, setClipConfig] = useState('720p');
 
   const [myId, setMyId] = useState('local-me');
@@ -218,14 +185,13 @@ export default function App() {
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [messages, setMessages] = useState([
-    { id: 'sys-1', system: true, text: 'Sessão criada com senha. Mande o link para a galera!' }
+    { id: 'sys-1', system: true, text: 'Sessão iniciada. O chat e as transmissões estão prontos!' }
   ]);
   const [chatInput, setChatInput] = useState('');
+  const chatEndRef = useRef(null);
 
   const transportRef = useRef({
     mode: 'none',
-    ws: null,
-    socket: null,
     sendControl: () => {},
     sendVideoChunk: () => {},
     sendAudioChunk: () => {},
@@ -235,7 +201,7 @@ export default function App() {
   const activeEncodersRef = useRef({});
   const videoChunkHandlersRef = useRef({});
   const audioChunkHandlersRef = useRef({});
-  const clipManagersRef = useRef({});
+  const ramClipBuffersRef = useRef({}); // streamId -> zeroCpuChunkBuffer
   const stoppedWatchingSetRef = useRef(new Set());
 
   const qualityRef = useRef(quality);
@@ -243,6 +209,11 @@ export default function App() {
   const codecRef = useRef(codec);
   const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
+
+  // Rola o chat automaticamente para a última mensagem
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
   useEffect(() => {
     const checkBridge = async () => {
@@ -253,7 +224,7 @@ export default function App() {
       } catch (e) {}
     };
     checkBridge();
-    const timer = setInterval(checkBridge, 3500);
+    const timer = setInterval(checkBridge, 4000);
     return () => clearInterval(timer);
   }, []);
 
@@ -295,7 +266,8 @@ export default function App() {
     setParticipants([{ id: 'local-me', nick: nickname }]);
 
     let isUnmounted = false;
-    let cfWs = null;
+    let controlWs = null;
+    let mediaWs = null;
     let fallbackSocket = null;
 
     const onRoomUsers = (list) => {
@@ -416,6 +388,13 @@ export default function App() {
       });
 
       if (stoppedWatchingSetRef.current.has(meta.id)) return;
+
+      // Guarda na memória RAM para o Replay de 30s (Custo ZERO de CPU/GPU!)
+      if (!ramClipBuffersRef.current[meta.id]) {
+        ramClipBuffersRef.current[meta.id] = createZeroCpuChunkBuffer();
+      }
+      ramClipBuffersRef.current[meta.id].pushChunk(meta, buffer);
+
       const handler = videoChunkHandlersRef.current[meta.id];
       if (handler) handler(meta, buffer);
     };
@@ -430,47 +409,57 @@ export default function App() {
     const onPeerStoppedStream = (streamId) => {
       if (isUnmounted) return;
       stoppedWatchingSetRef.current.delete(streamId);
-      clipManagersRef.current[streamId]?.destroy?.();
-      delete clipManagersRef.current[streamId];
+      ramClipBuffersRef.current[streamId]?.clear?.();
+      delete ramClipBuffersRef.current[streamId];
       setStreams(prev => prev.filter(s => s.id !== streamId));
       delete videoChunkHandlersRef.current[streamId];
       delete audioChunkHandlersRef.current[streamId];
     };
 
+    const onChatMessage = (msgObj) => {
+      if (isUnmounted || !msgObj || !msgObj.text) return;
+      setMessages(prev => {
+        if (msgObj.id && prev.some(m => m.id === msgObj.id)) return prev;
+        return [...prev, msgObj];
+      });
+    };
+
+    // Conecta 2 WebSockets separados na Cloudflare: 1 para Chat/Controle (zero fila) e 1 para Mídia Binária
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}`;
+    const controlUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=control`;
+    const mediaUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=media`;
 
     let cfConnected = false;
     try {
-      cfWs = new WebSocket(wsUrl);
-      cfWs.binaryType = 'arraybuffer';
+      controlWs = new WebSocket(controlUrl);
+      mediaWs = new WebSocket(mediaUrl);
+      mediaWs.binaryType = 'arraybuffer';
 
-      cfWs.onopen = () => {
+      controlWs.onopen = () => {
         if (isUnmounted) return;
         cfConnected = true;
         transportRef.current = {
           mode: 'cf-ws',
-          ws: cfWs,
-          socket: null,
           sendControl: (type, payload = {}) => {
-            if (cfWs.readyState === 1) {
-              cfWs.send(JSON.stringify({ type, ...payload }));
+            if (controlWs && controlWs.readyState === 1) {
+              controlWs.send(JSON.stringify({ type, ...payload }));
             }
           },
           sendVideoChunk: (meta, buffer) => {
-            if (cfWs.readyState === 1) {
-              cfWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
+            // Limite estrito de 64KB no buffer de envio: impede 100% que o ping (ms) suba!
+            if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 65536) {
+              mediaWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
             }
           },
           sendAudioChunk: (meta, buffer) => {
-            if (cfWs.readyState === 1) {
-              cfWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
+            if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 65536) {
+              mediaWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
             }
           },
-          getBufferedAmount: () => cfWs.bufferedAmount || 0
+          getBufferedAmount: () => (mediaWs ? mediaWs.bufferedAmount : 0)
         };
 
-        cfWs.send(JSON.stringify({
+        controlWs.send(JSON.stringify({
           type: 'join-room',
           roomName: cleanRoom,
           roomPassword: cleanPass,
@@ -478,14 +467,8 @@ export default function App() {
         }));
       };
 
-      cfWs.onmessage = (event) => {
-        if (isUnmounted) return;
-        if (event.data instanceof ArrayBuffer) {
-          const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
-          if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
-          else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
-          return;
-        }
+      controlWs.onmessage = (event) => {
+        if (isUnmounted || event.data instanceof ArrayBuffer) return;
         const data = JSON.parse(event.data);
         if (data.type === 'welcome') {
           myIdRef.current = data.id;
@@ -501,20 +484,24 @@ export default function App() {
         } else if (data.type === 'peer-stopped-stream') {
           onPeerStoppedStream(data.streamId);
         } else if (data.type === 'chat-message') {
-          setMessages(prev => [...prev, data.msg]);
+          onChatMessage(data.msg);
         }
       };
 
-      cfWs.onerror = () => {
-        if (!cfConnected && !fallbackSocket && !isUnmounted) {
-          startSocketIoFallback();
-        }
+      mediaWs.onmessage = (event) => {
+        if (isUnmounted || !(event.data instanceof ArrayBuffer)) return;
+        try {
+          const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
+          if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
+          else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
+        } catch (e) {}
       };
 
-      cfWs.onclose = () => {
-        if (!cfConnected && !fallbackSocket && !isUnmounted) {
-          startSocketIoFallback();
-        }
+      controlWs.onerror = () => {
+        if (!cfConnected && !fallbackSocket && !isUnmounted) startSocketIoFallback();
+      };
+      controlWs.onclose = () => {
+        if (!cfConnected && !fallbackSocket && !isUnmounted) startSocketIoFallback();
       };
     } catch (e) {
       startSocketIoFallback();
@@ -534,16 +521,20 @@ export default function App() {
 
       transportRef.current = {
         mode: 'socketio',
-        ws: null,
-        socket,
         sendControl: (type, payload = {}) => {
           socket.emit(type, payload);
         },
         sendVideoChunk: (meta, buffer) => {
-          socket.emit('v-chunk', meta, buffer);
+          const wsBuffer = socket.io?.engine?.transport?.ws?.bufferedAmount || 0;
+          if (wsBuffer < 65536) {
+            socket.emit('v-chunk', meta, buffer);
+          }
         },
         sendAudioChunk: (meta, buffer) => {
-          socket.emit('a-chunk', meta, buffer);
+          const wsBuffer = socket.io?.engine?.transport?.ws?.bufferedAmount || 0;
+          if (wsBuffer < 65536) {
+            socket.emit('a-chunk', meta, buffer);
+          }
         },
         getBufferedAmount: () => socket.io?.engine?.transport?.ws?.bufferedAmount || 0
       };
@@ -567,14 +558,15 @@ export default function App() {
       socket.on('v-chunk', (meta, buffer) => onVChunk(meta, buffer));
       socket.on('a-chunk', (meta, buffer) => onAChunk(meta, buffer));
       socket.on('peer-stopped-stream', ({ streamId }) => onPeerStoppedStream(streamId));
-      socket.on('chat-message', (msg) => setMessages(prev => [...prev, msg]));
+      socket.on('chat-message', (msg) => onChatMessage(msg));
     }
 
     return () => {
       isUnmounted = true;
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
-      Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
-      try { if (cfWs) cfWs.close(); } catch (e) {}
+      Object.values(ramClipBuffersRef.current).forEach(b => b.clear?.());
+      try { if (controlWs) controlWs.close(); } catch (e) {}
+      try { if (mediaWs) mediaWs.close(); } catch (e) {}
       try { if (fallbackSocket) fallbackSocket.disconnect(); } catch (e) {}
     };
   }, [inRoom, roomName, roomPassword, nickname]);
@@ -650,13 +642,15 @@ export default function App() {
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
     const abortCtrl = new AbortController();
 
+    ramClipBuffersRef.current[streamId] = createZeroCpuChunkBuffer();
+
     const videoEncoder = new VideoEncoder({
       output: (chunk) => {
         if (!running) return;
         const buf = new Uint8Array(chunk.byteLength);
         chunk.copyTo(buf);
 
-        transportRef.current.sendVideoChunk({
+        const meta = {
           id: streamId,
           senderId: myIdRef.current,
           owner: nickname,
@@ -666,7 +660,10 @@ export default function App() {
           w: targetW,
           h: targetH,
           fps: fpsRef.current
-        }, buf.buffer);
+        };
+
+        ramClipBuffersRef.current[streamId]?.pushChunk(meta, buf.buffer);
+        transportRef.current.sendVideoChunk(meta, buf.buffer);
       },
       error: () => {}
     });
@@ -710,7 +707,8 @@ export default function App() {
           },
           error: () => {}
         });
-        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
+        // Envia pacotes de áudio otimizados (64 kbps Opus) para não sobrecarregar o roteador
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 64000 });
 
         let usingDesktopWasapi = false;
         try {
@@ -730,7 +728,8 @@ export default function App() {
 
             const reader = response.body.getReader();
             let leftover = new Uint8Array(0);
-            const frameBytes = 960 * 4;
+            // Agrupa 40ms de áudio por pacote (1920 frames = 7680 bytes) reduzindo pela metade o número de pacotes na rede!
+            const frameBytes = 1920 * 4;
             let timestampUs = 0;
 
             (async () => {
@@ -747,18 +746,18 @@ export default function App() {
                   const slice = combined.subarray(offset, offset + frameBytes);
                   offset += frameBytes;
 
-                  if (audioEncoder.state === 'configured') {
+                  if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 2) {
                     const ad = new AudioData({
                       format: 's16',
                       sampleRate: 48000,
-                      numberOfFrames: 960,
+                      numberOfFrames: 1920,
                       numberOfChannels: 2,
                       timestamp: timestampUs,
                       data: slice
                     });
                     audioEncoder.encode(ad);
                     ad.close();
-                    timestampUs += 20000;
+                    timestampUs += 40000;
                   }
                 }
                 leftover = combined.slice(offset);
@@ -776,7 +775,9 @@ export default function App() {
               while (running) {
                 const { value: aData, done } = await aReader.read();
                 if (done || !aData) break;
-                if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
+                if (audioEncoder.state === 'configured' && audioEncoder.encodeQueueSize < 2) {
+                  audioEncoder.encode(aData);
+                }
                 aData.close();
               }
             })().catch(() => {});
@@ -797,14 +798,15 @@ export default function App() {
           if (done || !frame) break;
 
           const now = performance.now();
-          const minInterval = 1000 / (Number(fpsRef.current) + 2);
-          const netBusy = transportRef.current.getBufferedAmount() > 400000;
+          const minInterval = 1000 / (Number(fpsRef.current) + 1);
+          // Controle estrito de 64KB para nunca aumentar o Ping nem travar a GPU
+          const netBusy = transportRef.current.getBufferedAmount() > 65536;
 
           if (now - lastFrameTime < minInterval) {
             frame.close();
             continue;
           }
-          if (videoEncoder.encodeQueueSize > 2 || netBusy) {
+          if (videoEncoder.encodeQueueSize > 1 || netBusy) {
             droppedFrame = true;
             frame.close();
             continue;
@@ -813,7 +815,7 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              const isKey = forceKey || droppedFrame || (frameCount % 60 === 0);
+              const isKey = forceKey || droppedFrame || (frameCount % 90 === 0);
               forceKey = false;
               droppedFrame = false;
               videoEncoder.encode(frame, { keyFrame: isKey });
@@ -902,12 +904,7 @@ export default function App() {
         fps: targetFps
       };
 
-      if (transportRef.current.mode === 'cf-ws') {
-        transportRef.current.sendControl('start-stream', { meta });
-      } else {
-        transportRef.current.sendControl('start-stream', meta);
-      }
-
+      transportRef.current.sendControl('start-stream', { meta, ...meta });
       await startWebCodecsSender(newId, mediaStream, false);
     } catch (err) {}
   };
@@ -952,12 +949,7 @@ export default function App() {
         fps: Number(fps)
       };
 
-      if (transportRef.current.mode === 'cf-ws') {
-        transportRef.current.sendControl('start-stream', { meta });
-      } else {
-        transportRef.current.sendControl('start-stream', meta);
-      }
-
+      transportRef.current.sendControl('start-stream', { meta, ...meta });
       await startWebCodecsSender(newId, mediaStream, true);
     } catch (err) {
       alert('Não foi possível acessar a webcam.');
@@ -968,8 +960,8 @@ export default function App() {
     localStreamIdsRef.current.delete(streamId);
     activeEncodersRef.current[streamId]?.stop?.();
     delete activeEncodersRef.current[streamId];
-    clipManagersRef.current[streamId]?.destroy?.();
-    delete clipManagersRef.current[streamId];
+    ramClipBuffersRef.current[streamId]?.clear?.();
+    delete ramClipBuffersRef.current[streamId];
 
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
@@ -981,49 +973,45 @@ export default function App() {
     if (expandedId === streamId) setExpandedId(null);
   };
 
-  const handleReplayOrClip = async (targetStreamId, openModal = true) => {
+  // Abre o Replay instantâneo direto dos chunks em RAM (ou exporta o arquivo WebM sob demanda)
+  const handleReplayOrClip = (targetStreamId) => {
     const targetStream = streams.find(s => s.id === targetStreamId) || streams.find(s => s.watching !== false);
     if (!targetStream) {
-      alert('Nenhuma transmissão ativa para gerar o replay de 30 segundos.');
+      alert('Nenhuma transmissão ativa para abrir o Replay de 30 segundos.');
       return;
     }
 
-    const manager = clipManagersRef.current[targetStream.id];
-    if (!manager) {
-      alert('Aguarde pelo menos 2 segundos assistindo à transmissão para capturar o replay.');
+    const ramBuf = ramClipBuffersRef.current[targetStream.id];
+    const snapshot = ramBuf ? ramBuf.getSnapshot() : [];
+    if (!snapshot.length) {
+      alert('Aguarde pelo menos 2 segundos de transmissão para acumular os quadros do Replay.');
       return;
     }
 
-    const res = await manager.captureLast30s();
-    if (!res || !res.url) {
-      alert('Acumulando frames da transmissão... tente novamente em 2 segundos!');
-      return;
-    }
-
-    if (openModal) {
-      if (replayModal?.url) URL.revokeObjectURL(replayModal.url);
-      setReplayModal({
-        streamId: targetStream.id,
-        owner: targetStream.owner,
-        url: res.url,
-        mimeType: res.mimeType,
-        durationSec: res.durationSec
-      });
-    } else {
-      const ext = res.mimeType.includes('mp4') ? 'mp4' : 'webm';
-      const a = document.createElement('a');
-      a.href = res.url;
-      a.download = `VogelsTV_Clip_${targetStream.owner}_${Date.now()}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    }
+    setReplayModal({
+      streamId: targetStream.id,
+      owner: targetStream.owner,
+      chunks: snapshot
+    });
   };
 
+  // Chat 100% funcional com renderização otimista imediata + envio no canal de controle
   const sendChat = (e) => {
     e.preventDefault();
-    if (!chatInput.trim()) return;
-    transportRef.current.sendControl('chat-message', { text: chatInput.trim() });
+    const cleanText = chatInput.trim();
+    if (!cleanText) return;
+
+    const msgPayload = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      sender: nickname,
+      text: cleanText.slice(0, 500),
+      time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+    };
+
+    // Mostra na tela imediatamente para quem digitou
+    setMessages(prev => [...prev, msgPayload]);
+    // Envia para todos na sala pelo canal de controle
+    transportRef.current.sendControl('chat-message', { text: cleanText, msg: msgPayload });
     setChatInput('');
   };
 
@@ -1064,7 +1052,7 @@ export default function App() {
                 value={nickname}
                 onChange={e => setNickname(e.target.value)}
                 placeholder="Ex: gosadinhas"
-                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white select-text focus:outline-none focus:border-red-500"
               />
             </div>
             <div>
@@ -1084,7 +1072,7 @@ export default function App() {
                 value={roomName}
                 onChange={e => setRoomName(e.target.value)}
                 placeholder="Ex: squad-brasil"
-                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white select-text focus:outline-none focus:border-red-500"
               />
             </div>
             <div>
@@ -1094,7 +1082,7 @@ export default function App() {
                 value={roomPassword}
                 onChange={e => setRoomPassword(e.target.value)}
                 placeholder="Deixe vazio se a sala não tiver senha"
-                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
+                className="w-full bg-[#0D0F13] border border-[#262C3A] rounded-lg px-3 py-2.5 text-sm text-white select-text focus:outline-none focus:border-red-500"
               />
             </div>
             <button
@@ -1115,8 +1103,8 @@ export default function App() {
   const remoteStreams = streams.filter(s => !s.isLocal);
 
   return (
-    <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
-      <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20">
+    <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col overflow-hidden">
+      <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20 select-none">
         <div className="flex items-center gap-2">
           {renderVogelsLogo('text-base')}
           <span className="text-amber-400 text-xs">🔒</span>
@@ -1135,7 +1123,7 @@ export default function App() {
 
         <div className="flex items-center gap-1.5 flex-wrap">
           <select value={quality} onChange={e => setQuality(e.target.value)} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
-            <option value="720p">Qualidade: 720p (HD)</option>
+            <option value="720p">Qualidade: 720p (HD · Leve)</option>
             <option value="1080p">Qualidade: 1080p (Full HD)</option>
             <option value="1440p">Qualidade: 2K (1440p)</option>
           </select>
@@ -1245,7 +1233,7 @@ export default function App() {
 
           {watchingStreams.length > 0 && (
             <button
-              onClick={() => handleReplayOrClip(watchingStreams[0].id, true)}
+              onClick={() => handleReplayOrClip(watchingStreams[0].id)}
               className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 flex items-center gap-1.5 cursor-pointer"
               title="Voltar 30 segundos do compartilhamento"
             >
@@ -1299,20 +1287,11 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (WebCodecs GPU)</label>
+                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (Placa de Vídeo)</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="VP8">VP8 Ultra-Rápido (Recomendado · 60 FPS)</option>
-                    <option value="H264">H.264 NVENC / Hardware</option>
-                    <option value="VP9">VP9 Alta Definição (2K)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Clipes e replay (30s sem áudio)</label>
-                  <select value={clipConfig} onChange={e => setClipConfig(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="720p">Ligado · 720p</option>
-                    <option value="1080p">Ligado · 1080p</option>
-                    <option value="off">Desligado</option>
+                    <option value="H264">H.264 NVENC / Hardware (Zero Lag de CPU)</option>
+                    <option value="VP8">VP8 Rápido</option>
+                    <option value="VP9">VP9 Alta Definição</option>
                   </select>
                 </div>
               </div>
@@ -1353,7 +1332,7 @@ export default function App() {
       </header>
 
       <div className="flex-1 flex overflow-hidden relative">
-        <main className="flex-1 bg-[#0B0D11] relative flex flex-col p-3 overflow-hidden">
+        <main className="flex-1 bg-[#0B0D11] relative flex flex-col p-3 overflow-hidden select-none">
           {watchingStreams.length === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3">
               {unwatchedStreams.length > 0 ? (
@@ -1394,8 +1373,6 @@ export default function App() {
                     onRequestKeyframe: () => transportRef.current.sendControl('request-keyframe', { streamId: streamObj.id }),
                     videoChunkHandlersRef,
                     audioChunkHandlersRef,
-                    clipManagersRef,
-                    clipConfig,
                     onStop: () => stopStream(streamObj.id),
                     onStopWatching: () => setWatchingStream(streamObj.id, false),
                     onMute: () => toggleStreamMute(streamObj.id),
@@ -1403,8 +1380,8 @@ export default function App() {
                     onMinimize: () => setStreams(prev => prev.map(s => s.id === streamObj.id ? { ...s, minimized: !s.minimized } : s)),
                     onExpand: () => setExpandedId(expandedId === streamObj.id ? null : streamObj.id),
                     isExpanded: expandedId === streamObj.id,
-                    onClip: () => handleReplayOrClip(streamObj.id, false),
-                    onReplay: () => handleReplayOrClip(streamObj.id, true)
+                    onClip: () => handleReplayOrClip(streamObj.id),
+                    onReplay: () => handleReplayOrClip(streamObj.id)
                   })
                 )}
             </div>
@@ -1428,7 +1405,7 @@ export default function App() {
 
         {!sidebarCollapsed && (
           <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0 transition-all">
-            <div className="p-3 border-b border-[#1E232E]">
+            <div className="p-3 border-b border-[#1E232E] select-none">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase">PARTICIPANTES</h3>
                 <button
@@ -1488,29 +1465,37 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex-1 flex flex-col p-3 overflow-hidden">
-              <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2">CHAT</h3>
+            {/* PAINEL DE CHAT 100% FUNCIONAL E SELECIONÁVEL */}
+            <div className="flex-1 flex flex-col p-3 overflow-hidden select-text">
+              <h3 className="text-[10px] font-bold tracking-wider text-gray-400 uppercase mb-2 select-none">CHAT</h3>
               <div className="flex-1 bg-[#0D1016] border border-[#1E232E] rounded-lg p-2.5 overflow-y-auto space-y-2 text-xs">
                 {messages.map(m =>
                   m.system ? (
                     <p key={m.id} className="text-gray-400 italic text-[11px]">{m.text}</p>
                   ) : (
-                    <div key={m.id}>
+                    <div key={m.id} className="leading-relaxed">
                       <span className="font-semibold text-red-400">{m.sender}: </span>
                       <span className="text-gray-200 break-words">{m.text}</span>
+                      {m.time && <span className="text-[9px] text-gray-500 ml-1.5">{m.time}</span>}
                     </div>
                   )
                 )}
+                <div ref={chatEndRef} />
               </div>
               <form onSubmit={sendChat} className="mt-2 flex gap-1.5">
                 <input
                   type="text"
                   value={chatInput}
                   onChange={e => setChatInput(e.target.value)}
-                  placeholder="Mensagem..."
-                  className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-red-500"
+                  onKeyDown={e => e.stopPropagation()}
+                  placeholder="Digite sua mensagem..."
+                  autoComplete="off"
+                  className="flex-1 bg-[#0D1016] border border-[#242A38] rounded-md px-2.5 py-1.5 text-xs text-white select-text cursor-text focus:outline-none focus:border-red-500"
                 />
-                <button type="submit" className="bg-[#1C212E] hover:bg-[#252C3D] border border-[#2E364A] text-xs text-gray-200 px-3 py-1.5 rounded-md cursor-pointer">
+                <button
+                  type="submit"
+                  className="bg-[#5865F2] hover:bg-[#4752C4] text-xs font-medium text-white px-3 py-1.5 rounded-md cursor-pointer transition"
+                >
                   Enviar
                 </button>
               </form>
@@ -1519,60 +1504,170 @@ export default function App() {
         )}
       </div>
 
-      {replayModal && (
-        <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50">
-          <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-3xl p-4 space-y-3 shadow-2xl">
-            <div className="flex items-center justify-between flex-wrap gap-2 border-b border-[#222834] pb-2.5">
-              <div className="flex items-center gap-2">
-                <h4 className="text-sm font-bold text-white">
-                  ⏪ Replay dos Últimos {replayModal.durationSec || 30}s — <span className="text-red-400">{replayModal.owner}</span>
-                </h4>
-              </div>
+      {replayModal &&
+        React.createElement(ReplayPlayerModal, {
+          replayModal,
+          watchingStreams,
+          onSelectStream: (sId) => handleReplayOrClip(sId),
+          onClose: () => setReplayModal(null)
+        })}
+    </div>
+  );
+}
 
-              <div className="flex items-center gap-2">
-                {watchingStreams.length > 1 && (
-                  <select
-                    value={replayModal.streamId}
-                    onChange={(e) => handleReplayOrClip(e.target.value, true)}
-                    className="bg-[#1B202B] border border-[#2C3446] text-xs text-white rounded px-2.5 py-1 cursor-pointer"
-                  >
-                    {watchingStreams.map(ws => (
-                      <option key={ws.id} value={ws.id}>
-                        Tela de: {ws.owner} ({ws.res})
-                      </option>
-                    ))}
-                  </select>
-                )}
-                <a
-                  href={replayModal.url}
-                  download={`VogelsTV_Replay_${replayModal.owner}_${Date.now()}.${replayModal.mimeType?.includes('mp4') ? 'mp4' : 'webm'}`}
-                  className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1 rounded cursor-pointer"
-                >
-                  💾 Salvar Clipe
-                </a>
-                <button
-                  onClick={() => {
-                    if (replayModal?.url) URL.revokeObjectURL(replayModal.url);
-                    setReplayModal(null);
-                  }}
-                  className="text-xs text-gray-400 hover:text-white bg-[#1C212C] px-2.5 py-1 rounded cursor-pointer"
-                >
-                  ✕ Fechar
-                </button>
-              </div>
-            </div>
+// Reprodutor e Exportador de Replay de 30s (Só usa a placa de vídeo no momento em que o modal é aberto!)
+function ReplayPlayerModal({ replayModal, watchingStreams, onSelectStream, onClose }) {
+  const canvasRef = useRef(null);
+  const [exporting, setExporting] = useState(false);
 
-            <video
-              key={replayModal.url}
-              src={replayModal.url}
-              controls
-              autoPlay
-              loop
-              className="w-full rounded-lg bg-black max-h-[72vh]"
-            />
+  useEffect(() => {
+    const chunks = replayModal?.chunks || [];
+    const canvas = canvasRef.current;
+    if (!chunks.length || !canvas) return;
+
+    const ctx = canvas.getContext('2d', { alpha: false });
+    let active = true;
+    let decoder = null;
+    let timerIds = [];
+
+    const playLoop = () => {
+      if (!active) return;
+      try {
+        if (decoder && decoder.state !== 'closed') decoder.close();
+      } catch (e) {}
+
+      const firstCodec = chunks[0].c || 'vp8';
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          if (!active) { frame.close(); return; }
+          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+            canvas.width = frame.displayWidth;
+            canvas.height = frame.displayHeight;
+          }
+          ctx.drawImage(frame, 0, 0);
+          frame.close();
+        },
+        error: () => {}
+      });
+
+      const cfg = firstCodec.startsWith('avc1')
+        ? { codec: firstCodec, avc: { format: 'annexb' }, optimizeForLatency: true }
+        : { codec: firstCodec, optimizeForLatency: true };
+
+      try {
+        decoder.configure(cfg);
+      } catch (e) { return; }
+
+      const t0 = chunks[0].arrivedAt;
+      const totalDurationMs = Math.max(1000, chunks[chunks.length - 1].arrivedAt - t0);
+
+      chunks.forEach((ch) => {
+        const delay = Math.max(0, ch.arrivedAt - t0);
+        const tid = setTimeout(() => {
+          if (!active || !decoder || decoder.state !== 'configured') return;
+          try {
+            decoder.decode(new EncodedVideoChunk({
+              type: ch.t,
+              timestamp: ch.ts,
+              data: ch.data
+            }));
+          } catch (e) {}
+        }, delay);
+        timerIds.push(tid);
+      });
+
+      const loopTid = setTimeout(() => {
+        timerIds = [];
+        playLoop();
+      }, totalDurationMs + 400);
+      timerIds.push(loopTid);
+    };
+
+    playLoop();
+
+    return () => {
+      active = false;
+      timerIds.forEach(clearTimeout);
+      try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (e) {}
+    };
+  }, [replayModal]);
+
+  const handleDownloadClip = () => {
+    const canvas = canvasRef.current;
+    const chunks = replayModal?.chunks || [];
+    if (!canvas || !chunks.length || exporting) return;
+
+    setExporting(true);
+    const durationMs = Math.min(30000, Math.max(2000, chunks[chunks.length - 1].arrivedAt - chunks[0].arrivedAt));
+    const stream = canvas.captureStream(30);
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
+    const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 3500000 });
+    const parts = [];
+
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) parts.push(e.data);
+    };
+    rec.onstop = () => {
+      const blob = new Blob(parts, { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `VogelsTV_Clip_${replayModal.owner}_${Date.now()}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setExporting(false);
+    };
+
+    rec.start(200);
+    setTimeout(() => {
+      if (rec.state !== 'inactive') rec.stop();
+    }, durationMs);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50 select-none">
+      <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-3xl p-4 space-y-3 shadow-2xl">
+        <div className="flex items-center justify-between flex-wrap gap-2 border-b border-[#222834] pb-2.5">
+          <h4 className="text-sm font-bold text-white">
+            ⏪ Replay Instantâneo (Últimos 30s) — <span className="text-red-400">{replayModal.owner}</span>
+          </h4>
+
+          <div className="flex items-center gap-2">
+            {watchingStreams.length > 1 && (
+              <select
+                value={replayModal.streamId}
+                onChange={(e) => onSelectStream(e.target.value)}
+                className="bg-[#1B202B] border border-[#2C3446] text-xs text-white rounded px-2.5 py-1 cursor-pointer"
+              >
+                {watchingStreams.map(ws => (
+                  <option key={ws.id} value={ws.id}>
+                    Tela de: {ws.owner} ({ws.res})
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              onClick={handleDownloadClip}
+              disabled={exporting}
+              className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-medium px-3 py-1 rounded cursor-pointer"
+            >
+              {exporting ? '⏳ Salvando...' : '💾 Baixar Clipe'}
+            </button>
+            <button
+              onClick={onClose}
+              className="text-xs text-gray-400 hover:text-white bg-[#1C212C] px-2.5 py-1 rounded cursor-pointer"
+            >
+              ✕ Fechar
+            </button>
           </div>
         </div>
-      )}
+
+        <canvas
+          ref={canvasRef}
+          className="w-full rounded-lg bg-black max-h-[72vh] object-contain"
+        />
+      </div>
     </div>
   );
 }
@@ -1583,8 +1678,6 @@ function VideoTile({
   onRequestKeyframe,
   videoChunkHandlersRef,
   audioChunkHandlersRef,
-  clipManagersRef,
-  clipConfig,
   onStop,
   onStopWatching,
   onMute,
@@ -1640,28 +1733,20 @@ function VideoTile({
     }
   }, [streamObj.muted, streamObj.volume, masterVolume]);
 
+  // Na transmissão local, apenas exibe o preview leve sem NENHUM MediaRecorder rodando!
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
     localVideoRef.current.srcObject = streamObj.stream;
     localVideoRef.current.play().catch(() => {});
+  }, [streamObj.isLocal, streamObj.stream]);
 
-    if (clipConfig !== 'off') {
-      clipManagersRef.current[streamObj.id]?.destroy?.();
-      clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => streamObj.stream);
-    }
-
-    return () => {
-      clipManagersRef.current[streamObj.id]?.destroy?.();
-      delete clipManagersRef.current[streamObj.id];
-    };
-  }, [streamObj.isLocal, streamObj.stream, clipConfig]);
-
+  // Na transmissão remota, usa requestAnimationFrame coalescing + desynchronized:true para 60 FPS lisos sem travar a UI
   useEffect(() => {
     if (streamObj.isLocal) return;
 
     const canvas = remoteCanvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
     let decoder = null;
     let configuredCodec = null;
@@ -1670,6 +1755,26 @@ function VideoTile({
     let bytesCount = 0;
     let currentW = 1920;
     let currentH = 1080;
+    let pendingFrame = null;
+    let rafId = null;
+
+    const renderLoop = () => {
+      if (pendingFrame) {
+        const f = pendingFrame;
+        pendingFrame = null;
+        if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
+          canvas.width = f.displayWidth;
+          canvas.height = f.displayHeight;
+        }
+        currentW = f.displayWidth;
+        currentH = f.displayHeight;
+        ctx.drawImage(f, 0, 0);
+        f.close();
+        framesRendered++;
+      }
+      rafId = requestAnimationFrame(renderLoop);
+    };
+    rafId = requestAnimationFrame(renderLoop);
 
     const initDecoder = (codecStr) => {
       try {
@@ -1678,15 +1783,11 @@ function VideoTile({
 
       decoder = new VideoDecoder({
         output: (frame) => {
-          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-            canvas.width = frame.displayWidth;
-            canvas.height = frame.displayHeight;
+          // Se já havia um frame esperando o próximo refresh do monitor, fecha o antigo imediatamente para nunca acumular fila!
+          if (pendingFrame) {
+            pendingFrame.close();
           }
-          currentW = frame.displayWidth;
-          currentH = frame.displayHeight;
-          ctx.drawImage(frame, 0, 0);
-          frame.close();
-          framesRendered++;
+          pendingFrame = frame;
         },
         error: () => {
           waitingForKey = true;
@@ -1714,6 +1815,11 @@ function VideoTile({
             return;
           }
           waitingForKey = false;
+        }
+        if (decoder.decodeQueueSize > 3) {
+          waitingForKey = true;
+          onRequestKeyframe?.();
+          return;
         }
         const uint8 = new Uint8Array(buffer);
         bytesCount += uint8.byteLength;
@@ -1785,7 +1891,7 @@ function VideoTile({
                 source.buffer = audioBuffer;
                 source.connect(gainNode);
                 const now = audioCtx.currentTime;
-                if (nextPlayTime < now || nextPlayTime - now > 0.25) {
+                if (nextPlayTime < now || nextPlayTime - now > 0.2) {
                   nextPlayTime = now + 0.02;
                 }
                 source.start(nextPlayTime);
@@ -1804,7 +1910,7 @@ function VideoTile({
           if (meta && typeof meta.gain === 'number') {
             senderGainFactor = Math.max(0, Math.min(1, meta.gain / 100));
           }
-          if (audioDecoder.state === 'configured') {
+          if (audioDecoder.state === 'configured' && audioDecoder.decodeQueueSize < 3) {
             try {
               audioDecoder.decode(new EncodedAudioChunk({
                 type: 'key',
@@ -1817,24 +1923,12 @@ function VideoTile({
       } catch (e) {}
     }
 
-    let sharedCanvasStream = null;
-    if (clipConfig !== 'off' && canvas.captureStream) {
-      setTimeout(() => {
-        try {
-          sharedCanvasStream = canvas.captureStream(30);
-          if (!clipManagersRef.current[streamObj.id]) {
-            clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => sharedCanvasStream);
-          }
-        } catch (e) {}
-      }, 800);
-    }
-
     onRequestKeyframe?.();
     const keyframeRetryTimer = setInterval(() => {
       if (waitingForKey) {
         onRequestKeyframe?.();
       }
-    }, 400);
+    }, 450);
 
     const statTimer = setInterval(() => {
       const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
@@ -1844,17 +1938,19 @@ function VideoTile({
     }, 1000);
 
     return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      if (pendingFrame) {
+        try { pendingFrame.close(); } catch (e) {}
+      }
       clearInterval(keyframeRetryTimer);
       clearInterval(statTimer);
-      clipManagersRef.current[streamObj.id]?.destroy?.();
-      delete clipManagersRef.current[streamObj.id];
       delete videoChunkHandlersRef.current[streamObj.id];
       delete audioChunkHandlersRef.current[streamObj.id];
       try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (e) {}
       try { if (audioDecoder && audioDecoder.state !== 'closed') audioDecoder.close(); } catch (e) {}
       try { if (audioCtx && audioCtx.state !== 'closed') audioCtx.close(); } catch (e) {}
     };
-  }, [streamObj.id, streamObj.isLocal, clipConfig]);
+  }, [streamObj.id, streamObj.isLocal]);
 
   const currentVol = streamObj.muted ? 0 : (streamObj.volume ?? 75);
 

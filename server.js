@@ -32,7 +32,7 @@ function normalizeRoomKey(rawRoom, rawPassword) {
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 1e7,
+  maxHttpBufferSize: 5e6,
   pingTimeout: 60000,
   pingInterval: 15000,
   perMessageDeflate: false
@@ -73,16 +73,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('start-stream', (meta) => {
+  socket.on('start-stream', (payload) => {
     if (!currentRoom || !activeStreams.has(currentRoom)) return;
+    const meta = payload.meta || payload;
     const roomStreams = activeStreams.get(currentRoom);
     for (const [sId, sMeta] of roomStreams.entries()) {
-      if (sMeta.senderId === socket.id) {
-        roomStreams.delete(sId);
-      }
+      if (sMeta.senderId === socket.id) roomStreams.delete(sId);
     }
     const streamData = { ...meta, senderId: socket.id };
-    roomStreams.set(meta.streamId, streamData);
+    roomStreams.set(streamData.streamId, streamData);
     io.to(currentRoom).emit('active-streams', Array.from(roomStreams.values()));
     socket.to(currentRoom).emit('stream-started', streamData);
   });
@@ -117,17 +116,19 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('chat-message', ({ text }) => {
+  socket.on('chat-message', (data) => {
     if (!currentRoom) return;
     const sender = rooms.get(currentRoom)?.get(socket.id);
-    if (!sender || !text || !String(text).trim()) return;
+    const rawText = data?.msg?.text || data?.text || '';
+    if (!String(rawText).trim()) return;
 
-    io.to(currentRoom).emit('chat-message', {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      sender: sender.nick,
-      text: String(text).trim().slice(0, 500),
-      time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
-    });
+    const msgPayload = {
+      id: data?.msg?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sender: sender?.nick || data?.msg?.sender || 'Participante',
+      text: String(rawText).trim().slice(0, 500),
+      time: data?.msg?.time || new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+    };
+    io.to(currentRoom).emit('chat-message', msgPayload);
   });
 
   socket.on('disconnect', () => {
