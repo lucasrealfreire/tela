@@ -3,10 +3,11 @@ import { io } from 'socket.io-client';
 
 const MASTER_RENDER_URL = 'https://telinha-platform.onrender.com';
 
+// Bitrates otimizados para não estourar limite de banda no modo Relay e entregar 60fps lisos no P2P
 const RES_CONFIG = {
-  '720p': { width: 1280, height: 720, bitrate: 3500000, label: '720p' },
-  '1080p': { width: 1920, height: 1080, bitrate: 6000000, label: '1080p' },
-  '1440p': { width: 2560, height: 1440, bitrate: 9000000, label: '2K (1440p)' }
+  '720p': { width: 1280, height: 720, bitrate: 1800000, p2pBitrate: 6000000, label: '720p' },
+  '1080p': { width: 1920, height: 1080, bitrate: 2800000, p2pBitrate: 10000000, label: '1080p' },
+  '1440p': { width: 2560, height: 1440, bitrate: 4200000, p2pBitrate: 15000000, label: '2K (1440p)' }
 };
 
 function VogelsLogo({ size = 'text-sm' }) {
@@ -69,7 +70,6 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
   return { codec: 'vp8', width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
 }
 
-// Motor de Buffer Circular de 30 Segundos (6 gravadores escalonados de 5 em 5s para entregar 30s exatos e 100% reproduzíveis)
 function createRolling30sBuffer(getStreamFn) {
   let slots = [];
   let active = true;
@@ -86,7 +86,7 @@ function createRolling30sBuffer(getStreamFn) {
       const s = getStreamFn();
       if (!s || !s.getVideoTracks().length) return;
       const videoOnly = new MediaStream([s.getVideoTracks()[0]]);
-      const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 3500000 });
+      const rec = new MediaRecorder(videoOnly, { mimeType, videoBitsPerSecond: 3000000 });
       const slot = { rec, chunks: [], startTime: Date.now(), mimeType };
 
       rec.ondataavailable = (e) => {
@@ -95,7 +95,6 @@ function createRolling30sBuffer(getStreamFn) {
       rec.start(250);
       slots.push(slot);
 
-      // Mantém 7 slots escalonados de 5s: o mais antigo sempre tem ~30 segundos exatos de vídeo!
       while (slots.length > 7) {
         const old = slots.shift();
         try { if (old.rec.state !== 'inactive') old.rec.stop(); } catch (e) {}
@@ -113,7 +112,6 @@ function createRolling30sBuffer(getStreamFn) {
         if (!validSlots.length) return resolve(null);
 
         const now = Date.now();
-        // Seleciona o slot mais próximo de 30s de duração (ou o mais antigo disponível)
         let chosen = validSlots[0];
         for (const sl of validSlots) {
           const age = (now - sl.startTime) / 1000;
@@ -168,12 +166,8 @@ export default function App() {
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showMixer, setShowMixer] = useState(false);
-
-  // Item 7: Minimizar / Expandir o painel lateral direito (Participantes + Chat)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-
-  // Item 4: Modal de Replay de 30 segundos com seletor de qual compartilhamento assistir
-  const [replayModal, setReplayModal] = useState(null); // { streamId, owner, url, mimeType, durationSec }
+  const [replayModal, setReplayModal] = useState(null);
 
   const [outgoingVolume, setOutgoingVolume] = useState(() => {
     const saved = localStorage.getItem('tv_out_vol');
@@ -189,8 +183,6 @@ export default function App() {
     const saved = localStorage.getItem('tv_exclude_discord');
     return saved !== null ? saved === 'true' : true;
   });
-  const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
-  const [discordIsolatedActive, setDiscordIsolatedActive] = useState(false);
 
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
@@ -204,6 +196,9 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
 
   const socketRef = useRef(null);
+  const peerRef = useRef(null);
+  const participantsRef = useRef([]);
+  const localStreamsRef = useRef([]);
   const activeEncodersRef = useRef({});
   const videoChunkHandlersRef = useRef({});
   const audioChunkHandlersRef = useRef({});
@@ -213,24 +208,9 @@ export default function App() {
   const qualityRef = useRef(quality);
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
-  const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
 
   useEffect(() => {
-    const checkBridge = async () => {
-      try {
-        const res = await fetch('http://127.0.0.1:19876/ping', { method: 'GET', mode: 'cors' });
-        const data = await res.json();
-        if (data?.ok) setDesktopBridgeActive(true);
-      } catch (e) {}
-    };
-    checkBridge();
-    const timer = setInterval(checkBridge, 4000);
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    excludeDiscordRef.current = excludeDiscordAudio;
     localStorage.setItem('tv_exclude_discord', String(excludeDiscordAudio));
   }, [excludeDiscordAudio]);
 
@@ -323,7 +303,8 @@ export default function App() {
     if (!inRoom) return;
 
     const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-    const targetServer = window.location.hostname.includes('onrender.com')
+    // Se estiver hospedado no Cloudflare Pages (pages.dev) ou Render, usa o sinalizador unificado
+    const targetServer = (window.location.hostname.includes('onrender.com') || window.location.hostname.includes('pages.dev'))
       ? MASTER_RENDER_URL
       : window.location.origin;
 
@@ -333,15 +314,98 @@ export default function App() {
     });
     socketRef.current = socket;
 
+    // Inicializa PeerJS P2P Direto (Transmite direto entre os PCs no Cloudflare Pages sem gastar banda do Render!)
+    let myPeer = null;
+    if (window.Peer) {
+      try {
+        myPeer = new window.Peer(undefined, {
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun.cloudflare.com:3478' }
+            ]
+          }
+        });
+        peerRef.current = myPeer;
+
+        myPeer.on('open', (peerId) => {
+          socket.emit('join-room', {
+            roomName: cleanRoom,
+            roomPassword: cleanPass,
+            nickname,
+            peerId
+          });
+        });
+
+        myPeer.on('call', (call) => {
+          call.answer();
+          call.on('stream', (remoteMediaStream) => {
+            const meta = call.metadata || {};
+            if (!meta.streamId) return;
+            setStreams(prev => {
+              const exists = prev.find(s => s.id === meta.streamId);
+              if (exists) {
+                return prev.map(s => s.id === meta.streamId ? { ...s, p2pStream: remoteMediaStream } : s);
+              }
+              const isStopped = stoppedWatchingSetRef.current.has(meta.streamId);
+              return [
+                ...prev,
+                {
+                  id: meta.streamId,
+                  senderId: meta.senderId,
+                  owner: meta.owner || 'Participante',
+                  type: meta.type || 'Tela',
+                  res: meta.res || '1080p',
+                  fps: meta.fps || 60,
+                  p2pStream: remoteMediaStream,
+                  volume: 75,
+                  muted: false,
+                  minimized: false,
+                  watching: !isStopped,
+                  watchSession: 1,
+                  isLocal: false
+                }
+              ];
+            });
+          });
+        });
+      } catch (e) {}
+    }
+
     socket.on('connect', () => {
       socket.emit('join-room', {
         roomName: cleanRoom,
         roomPassword: cleanPass,
-        nickname
+        nickname,
+        peerId: myPeer?.id || null
       });
     });
 
-    socket.on('room-users', (list) => setParticipants(list));
+    socket.on('room-users', (list) => {
+      participantsRef.current = list;
+      setParticipants(list);
+      // Envia stream P2P direto para novos participantes que tiverem peerId
+      if (myPeer) {
+        list.forEach(u => {
+          if (u.id !== socket.id && u.peerId) {
+            localStreamsRef.current.forEach(ls => {
+              try {
+                myPeer.call(u.peerId, ls.stream, {
+                  metadata: {
+                    streamId: ls.id,
+                    senderId: socket.id,
+                    owner: nickname,
+                    type: ls.type,
+                    res: ls.res,
+                    fps: ls.fps
+                  }
+                });
+              } catch (e) {}
+            });
+          }
+        });
+      }
+    });
 
     socket.on('active-streams', (list) => {
       setStreams(prev => {
@@ -470,6 +534,7 @@ export default function App() {
     return () => {
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
       Object.values(clipManagersRef.current).forEach(m => m.destroy?.());
+      if (myPeer) myPeer.destroy();
       socket.disconnect();
     };
   }, [inRoom, roomName, roomPassword, nickname]);
@@ -484,7 +549,6 @@ export default function App() {
     let currentCodecStr = 'vp8';
     let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
-    const abortCtrl = new AbortController();
 
     const videoEncoder = new VideoEncoder({
       output: (chunk) => {
@@ -528,7 +592,8 @@ export default function App() {
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
     let audioEncoder = null;
-    if (!isCamera && 'AudioEncoder' in window) {
+    const aTrack = mediaStream.getAudioTracks()[0];
+    if (!isCamera && aTrack && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window) {
       try {
         audioEncoder = new AudioEncoder({
           output: (chunk) => {
@@ -545,75 +610,17 @@ export default function App() {
           },
           error: () => {}
         });
-        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
-
-        let usingDesktopWasapi = false;
-        if (desktopBridgeActive) {
-          try {
-            const excludeFlag = excludeDiscordRef.current ? 1 : 0;
-            const response = await fetch(`http://127.0.0.1:19876/clean-audio?exclude=${excludeFlag}`, {
-              signal: abortCtrl.signal
-            });
-            if (response.ok && response.body) {
-              usingDesktopWasapi = true;
-              setDiscordIsolatedActive(excludeDiscordRef.current);
-              mediaStream.getAudioTracks().forEach(t => { t.enabled = false; t.stop(); });
-
-              const reader = response.body.getReader();
-              let leftover = new Uint8Array(0);
-              const frameBytes = 960 * 4;
-              let timestampUs = 0;
-
-              (async () => {
-                while (running) {
-                  const { value, done } = await reader.read();
-                  if (done || !value) break;
-
-                  const combined = new Uint8Array(leftover.length + value.length);
-                  combined.set(leftover, 0);
-                  combined.set(value, leftover.length);
-
-                  let offset = 0;
-                  while (offset + frameBytes <= combined.length) {
-                    const slice = combined.subarray(offset, offset + frameBytes);
-                    offset += frameBytes;
-
-                    if (audioEncoder.state === 'configured') {
-                      const ad = new AudioData({
-                        format: 's16',
-                        sampleRate: 48000,
-                        numberOfFrames: 960,
-                        numberOfChannels: 2,
-                        timestamp: timestampUs,
-                        data: slice
-                      });
-                      audioEncoder.encode(ad);
-                      ad.close();
-                      timestampUs += 20000;
-                    }
-                  }
-                  leftover = combined.slice(offset);
-                }
-              })().catch(() => {});
-            }
-          } catch (e) {}
-        }
-
-        if (!usingDesktopWasapi) {
-          const aTrack = mediaStream.getAudioTracks()[0];
-          if (aTrack && 'MediaStreamTrackProcessor' in window) {
-            const aProc = new MediaStreamTrackProcessor({ track: aTrack });
-            const aReader = aProc.readable.getReader();
-            (async () => {
-              while (running) {
-                const { value: aData, done } = await aReader.read();
-                if (done || !aData) break;
-                if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
-                aData.close();
-              }
-            })().catch(() => {});
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 96000 });
+        const aProc = new MediaStreamTrackProcessor({ track: aTrack });
+        const aReader = aProc.readable.getReader();
+        (async () => {
+          while (running) {
+            const { value: aData, done } = await aReader.read();
+            if (done || !aData) break;
+            if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
+            aData.close();
           }
-        }
+        })().catch(() => {});
       } catch (e) {}
     }
 
@@ -623,6 +630,7 @@ export default function App() {
 
       (async () => {
         let lastFrameTime = 0;
+        let droppedFrame = false;
         while (running) {
           const { value: frame, done } = await reader.read();
           if (done || !frame) break;
@@ -630,9 +638,14 @@ export default function App() {
           const now = performance.now();
           const minInterval = 1000 / (Number(fpsRef.current) + 2);
           const ws = socketRef.current?.io?.engine?.transport?.ws;
-          const netBusy = ws && ws.bufferedAmount > 450000;
+          const netBusy = ws && ws.bufferedAmount > 250000;
 
-          if (now - lastFrameTime < minInterval || videoEncoder.encodeQueueSize > 2 || netBusy) {
+          if (now - lastFrameTime < minInterval) {
+            frame.close();
+            continue;
+          }
+          if (videoEncoder.encodeQueueSize > 2 || netBusy) {
+            droppedFrame = true;
             frame.close();
             continue;
           }
@@ -640,8 +653,10 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              const isKey = forceKey || (frameCount % 60 === 0);
+              // Se descartou algum frame por gargalo de rede, gera Keyframe imediato para não travar em 1 FPS!
+              const isKey = forceKey || droppedFrame || (frameCount % 60 === 0);
               forceKey = false;
+              droppedFrame = false;
               videoEncoder.encode(frame, { keyFrame: isKey });
               frameCount++;
             }
@@ -661,8 +676,6 @@ export default function App() {
       },
       stop: () => {
         running = false;
-        abortCtrl.abort();
-        setDiscordIsolatedActive(false);
         try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
         try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch (e) {}
       }
@@ -674,6 +687,7 @@ export default function App() {
       const cfg = RES_CONFIG[quality] || RES_CONFIG['1080p'];
       const targetFps = Number(fps);
 
+      // Usa windowAudio: 'window' quando a opção de isolar o Discord está ativa
       const mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: cfg.width, max: 2560 },
@@ -685,7 +699,9 @@ export default function App() {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false
-        }
+        },
+        windowAudio: excludeDiscordAudio ? 'window' : 'system',
+        systemAudio: 'include'
       });
 
       const vTrack = mediaStream.getVideoTracks()[0];
@@ -712,7 +728,29 @@ export default function App() {
         isLocal: true
       };
 
+      localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
+
+      // Conecta via P2P Direto (PeerJS) para amigos na sala
+      if (peerRef.current) {
+        participantsRef.current.forEach(u => {
+          if (u.id !== socketRef.current?.id && u.peerId) {
+            try {
+              peerRef.current.call(u.peerId, mediaStream, {
+                metadata: {
+                  streamId: newId,
+                  senderId: socketRef.current?.id,
+                  owner: nickname,
+                  type: newStreamObj.type,
+                  res: cfg.label,
+                  fps: targetFps
+                }
+              });
+            } catch (e) {}
+          }
+        });
+      }
+
       socketRef.current?.emit('start-stream', {
         streamId: newId,
         owner: nickname,
@@ -751,7 +789,9 @@ export default function App() {
         isLocal: true
       };
 
+      localStreamsRef.current.push(newStreamObj);
       setStreams(prev => [...prev, newStreamObj]);
+
       socketRef.current?.emit('start-stream', {
         streamId: newId,
         owner: nickname,
@@ -771,6 +811,7 @@ export default function App() {
     delete activeEncodersRef.current[streamId];
     clipManagersRef.current[streamId]?.destroy?.();
     delete clipManagersRef.current[streamId];
+    localStreamsRef.current = localStreamsRef.current.filter(s => s.id !== streamId);
 
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
@@ -782,7 +823,6 @@ export default function App() {
     if (expandedId === streamId) setExpandedId(null);
   };
 
-  // Item 4: Abre o Replay voltando 30 segundos do compartilhamento escolhido (ou baixa o clipe)
   const handleReplayOrClip = async (targetStreamId, openModal = true) => {
     const targetStream = streams.find(s => s.id === targetStreamId) || streams.find(s => s.watching !== false);
     if (!targetStream) {
@@ -829,16 +869,13 @@ export default function App() {
     setChatInput('');
   };
 
-  const copyRoomLink = () => {
-    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-    const base = window.location.hostname.includes('onrender.com') ? MASTER_RENDER_URL : window.location.origin;
-    const url = `${base}/?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
-    navigator.clipboard.writeText(url);
-    alert(`Link da sala copiado:\n${url}`);
-  };
-
   const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-  const directExeUrl = `/api/download-app?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
+  const currentRoomUrl = `${window.location.origin}/?sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
+
+  const copyRoomLink = () => {
+    navigator.clipboard.writeText(currentRoomUrl);
+    alert(`Link da sala copiado:\n${currentRoomUrl}`);
+  };
 
   if (!inRoom) {
     return (
@@ -846,11 +883,6 @@ export default function App() {
         <div className="w-full max-w-sm bg-[#151922] border border-[#232936] rounded-xl p-6 shadow-2xl">
           <div className="flex items-center justify-between mb-6">
             <VogelsLogo size="text-2xl" />
-            {desktopBridgeActive && (
-              <span className="text-[11px] bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 px-2 py-0.5 rounded font-medium">
-                App Windows Ativo
-              </span>
-            )}
           </div>
           <form
             onSubmit={(e) => {
@@ -931,11 +963,6 @@ export default function App() {
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-300 px-2 py-0.5 rounded-full">
             {participants.length} online
           </span>
-          {discordIsolatedActive && (
-            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full">
-              🛡️ Voz do Discord Isolada
-            </span>
-          )}
         </div>
 
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -1099,7 +1126,7 @@ export default function App() {
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Ativado por padrão: você continua ouvindo seus amigos no Discord normalmente, mas a voz deles não sai na sua transmissão.
+                    Ativado por padrão: captura o áudio da janela/jogo sem transmitir a voz do Discord para quem assiste.
                   </p>
                 </div>
 
@@ -1124,10 +1151,13 @@ export default function App() {
             )}
           </div>
 
-          {/* Item 3: Link nativo direto para baixar o VogelsTV.exe */}
+          {/* Download estático direto do arquivo /VogelsTV.exe + cópia automática do link da sala para o executável abrir direto nela */}
           <a
-            href={directExeUrl}
+            href="/VogelsTV.exe"
             download="VogelsTV.exe"
+            onClick={() => {
+              try { navigator.clipboard.writeText(currentRoomUrl); } catch (e) {}
+            }}
             className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer inline-flex items-center"
             title="Baixar arquivo executável VogelsTV.exe"
           >
@@ -1138,7 +1168,6 @@ export default function App() {
             🔗 Link
           </button>
 
-          {/* Item 7: Botão para minimizar / expandir o painel de Chat e Participantes */}
           <button
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
             className={`border text-xs rounded-md px-2.5 py-1.5 flex items-center gap-1 cursor-pointer transition ${
@@ -1146,7 +1175,7 @@ export default function App() {
                 ? 'bg-red-600/25 border-red-500/60 text-red-200'
                 : 'bg-[#171B24] hover:bg-[#1E2330] border-[#282E3D] text-gray-200'
             }`}
-            title={sidebarCollapsed ? 'Expandir Chat e Participantes' : 'Minimizar Chat e Participantes (Modo Clean)'}
+            title={sidebarCollapsed ? 'Expandir Chat e Participantes' : 'Minimizar Chat e Participantes'}
           >
             <span>💬</span> {sidebarCollapsed ? 'Abrir Chat' : 'Ocultar Chat'}
           </button>
@@ -1231,7 +1260,6 @@ export default function App() {
           </div>
         </main>
 
-        {/* Item 7: Painel Lateral Direito Retrátil (Participantes + Chat) */}
         {!sidebarCollapsed && (
           <aside className="w-72 bg-[#12151C] border-l border-[#1E232E] flex flex-col shrink-0 transition-all">
             <div className="p-3 border-b border-[#1E232E]">
@@ -1263,7 +1291,6 @@ export default function App() {
                         </span>
                       </div>
 
-                      {/* Item 2: Só aparece botão Assistir / Parar de assistir se o usuário estiver compartilhando tela! */}
                       {isMe && hasActiveStream && (
                         <button
                           onClick={() => userStreams.forEach(s => stopStream(s.id))}
@@ -1327,7 +1354,6 @@ export default function App() {
         )}
       </div>
 
-      {/* Item 4: Modal de Replay de 30 Segundos com escolha de compartilhamento */}
       {replayModal && (
         <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-3xl p-4 space-y-3 shadow-2xl">
@@ -1338,7 +1364,6 @@ export default function App() {
                 </h4>
               </div>
 
-              {/* Seletor para trocar qual compartilhamento ver o Replay */}
               <div className="flex items-center gap-2">
                 {watchingStreams.length > 1 && (
                   <select
@@ -1406,11 +1431,12 @@ function VideoTile({
   onReplay
 }) {
   const localVideoRef = useRef(null);
+  const remoteP2PVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
-  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
+  const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0', mode: '' });
+  const [p2pActive, setP2pActive] = useState(false);
 
-  // Item 5: Visibilidade dos controles estilo YouTube (aparece ao mover o mouse e some após 2.5 segundos)
   const [controlsVisible, setControlsVisible] = useState(true);
   const hideTimerRef = useRef(null);
 
@@ -1443,13 +1469,42 @@ function VideoTile({
     volumeRef.current = streamObj.volume ?? 75;
     masterVolRef.current = masterVolume ?? 80;
 
+    const effectiveGain = streamObj.muted
+      ? 0
+      : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
+
     if (gainNodeRef.current) {
-      const effectiveGain = streamObj.muted
-        ? 0
-        : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
       gainNodeRef.current.gain.value = effectiveGain;
     }
+    if (remoteP2PVideoRef.current) {
+      remoteP2PVideoRef.current.muted = streamObj.muted || effectiveGain === 0;
+      remoteP2PVideoRef.current.volume = Math.max(0, Math.min(1, effectiveGain));
+    }
   }, [streamObj.muted, streamObj.volume, masterVolume]);
+
+  // Se o PeerJS P2P Direto conectar (usado no Cloudflare Pages), reproduz direto a 60 FPS sem passar pelo servidor!
+  useEffect(() => {
+    if (streamObj.isLocal || !streamObj.p2pStream || !remoteP2PVideoRef.current) return;
+    const el = remoteP2PVideoRef.current;
+    el.srcObject = streamObj.p2pStream;
+    el.muted = true;
+    el.play().then(() => {
+      const eff = streamObj.muted ? 0 : ((streamObj.volume ?? 75) / 100) * ((masterVolume ?? 80) / 100);
+      el.muted = streamObj.muted || eff === 0;
+      el.volume = Math.max(0, Math.min(1, eff));
+    }).catch(() => {});
+
+    const timer = setInterval(() => {
+      if (el.videoWidth > 0 && el.readyState >= 2) {
+        setP2pActive(true);
+        if (clipConfig !== 'off' && !clipManagersRef.current[streamObj.id]) {
+          clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => streamObj.p2pStream);
+        }
+      }
+    }, 500);
+
+    return () => clearInterval(timer);
+  }, [streamObj.p2pStream, streamObj.isLocal]);
 
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
@@ -1472,7 +1527,6 @@ function VideoTile({
 
     const canvas = remoteCanvasRef.current;
     if (!canvas) return;
-    // Importante: sem desynchronized:true para que canvas.captureStream(30) capture 100% dos quadros no Replay de 30s!
     const ctx = canvas.getContext('2d', { alpha: false });
 
     let decoder = null;
@@ -1629,14 +1683,14 @@ function VideoTile({
       } catch (e) {}
     }
 
-    // Inicia o Buffer Circular de 30s da transmissão remota
     let sharedCanvasStream = null;
     if (clipConfig !== 'off' && canvas.captureStream) {
       setTimeout(() => {
         try {
           sharedCanvasStream = canvas.captureStream(30);
-          clipManagersRef.current[streamObj.id]?.destroy?.();
-          clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => sharedCanvasStream);
+          if (!clipManagersRef.current[streamObj.id]) {
+            clipManagersRef.current[streamObj.id] = createRolling30sBuffer(() => sharedCanvasStream);
+          }
         } catch (e) {}
       }, 800);
     }
@@ -1650,7 +1704,7 @@ function VideoTile({
 
     const statTimer = setInterval(() => {
       const mbps = ((bytesCount * 8) / 1000000).toFixed(1);
-      setStats({ w: currentW, h: currentH, fps: framesRendered, mbps });
+      setStats({ w: currentW, h: currentH, fps: framesRendered, mbps, mode: 'Relay' });
       framesRendered = 0;
       bytesCount = 0;
     }, 1000);
@@ -1688,13 +1742,20 @@ function VideoTile({
           className="w-full h-full object-contain bg-black"
         />
       ) : (
-        <canvas
-          ref={remoteCanvasRef}
-          className="w-full h-full object-contain bg-black"
-        />
+        <>
+          <video
+            ref={remoteP2PVideoRef}
+            autoPlay
+            playsInline
+            className={`w-full h-full object-contain bg-black ${p2pActive ? 'block' : 'hidden'}`}
+          />
+          <canvas
+            ref={remoteCanvasRef}
+            className={`w-full h-full object-contain bg-black ${p2pActive ? 'hidden' : 'block'}`}
+          />
+        </>
       )}
 
-      {/* Barra Superior do Player (Some após 2.5s sem mexer o mouse, igual ao YouTube) */}
       <div
         className={`absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs transition-opacity duration-300 ${
           controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
@@ -1705,11 +1766,12 @@ function VideoTile({
         <span className="text-emerald-300 font-mono text-[11px]">
           {streamObj.isLocal
             ? `· ${streamObj.res} · ${streamObj.fps} FPS · Local`
+            : p2pActive
+            ? `· ${streamObj.res} · ${streamObj.fps} FPS · P2P Direto`
             : `· ${stats.h ? stats.h + 'p' : streamObj.res} · ${stats.fps} FPS · ${stats.mbps} Mbps`}
         </span>
       </div>
 
-      {/* Barra Inferior de Controles (Some após 2.5s sem mexer o mouse, igual ao YouTube) */}
       <div
         className={`absolute bottom-2.5 right-2.5 z-30 flex items-center gap-2 bg-black/85 px-2.5 py-1.5 rounded-lg border border-white/10 transition-opacity duration-300 ${
           controlsVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
