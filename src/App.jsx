@@ -60,16 +60,14 @@ function unpackBinaryFrame(arrayBuffer) {
   return { headerObj, payloadBuffer };
 }
 
-// Prioriza H.264 High Profile Level 5.1 (avc1.640033 / NVENC CABAC) para 8000 kbps sem quadriculados!
+// Configura High Profile com VBR (Variable Bitrate) para manter imagem limpa sem estourar o limite de tráfego da Cloudflare!
 async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
   const w = Math.max(2, Math.floor(width / 2) * 2);
   const h = Math.max(2, Math.floor(height / 2) * 2);
 
   const candidates = [
-    preferredCodec === 'H264' ? { codec: 'avc1.640033', avc: { format: 'annexb' } } : null,
     preferredCodec === 'H264' ? { codec: 'avc1.64002a', avc: { format: 'annexb' } } : null,
     preferredCodec === 'H264' ? { codec: 'avc1.4d002a', avc: { format: 'annexb' } } : null,
-    preferredCodec === 'VP9' ? { codec: 'vp09.00.41.08' } : null,
     preferredCodec === 'VP9' ? { codec: 'vp09.00.10.08' } : null,
     { codec: 'vp8' },
     { codec: 'avc1.42e01f', avc: { format: 'annexb' } }
@@ -83,6 +81,7 @@ async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCo
           width: w,
           height: h,
           bitrate,
+          bitrateMode: 'variable',
           framerate: fps,
           latencyMode: 'realtime',
           hardwareAcceleration: hw
@@ -144,9 +143,8 @@ export default function App() {
   const [roomPassword, setRoomPassword] = useState('');
 
   const [quality, setQuality] = useState('1080p');
-  // Bitrate padrão em 8000 kbps (8 Mbps), igual ao OBS / salinha.live
-  const [bitrateKbps, setBitrateKbps] = useState(8000);
-  const [sharpness, setSharpness] = useState('motion');
+  // 4000 kbps VBR High Profile por padrão: imagem limpa a 60fps sem derrubar a instância da Cloudflare!
+  const [bitrateKbps, setBitrateKbps] = useState(4000);
   const [fps, setFps] = useState(60);
   const [gameMode, setGameMode] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
@@ -173,15 +171,18 @@ export default function App() {
 
   const [codec, setCodec] = useState('H264');
 
-  const [myId, setMyId] = useState('local-me');
-  const myIdRef = useRef('local-me');
+  // ID único persistente desta aba (garante que reconexões automáticas nunca dupliquem nem derrubem o usuário!)
+  const persistentClientIdRef = useRef('u_' + Math.random().toString(36).substring(2, 10));
+  const [myId, setMyId] = useState(persistentClientIdRef.current);
+  const myIdRef = useRef(persistentClientIdRef.current);
   const localStreamIdsRef = useRef(new Set());
+  const activeLocalMetasRef = useRef(new Map()); // streamId -> meta (para reanunciar automaticamente após reconexão!)
 
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [messages, setMessages] = useState([
-    { id: 'sys-1', system: true, text: 'Sessão iniciada em alta taxa de bits (8000 kbps). Mande o link para a galera!' }
+    { id: 'sys-1', system: true, text: 'Sessão iniciada com proteção Anti-Queda ativa. Mande o link para a galera!' }
   ]);
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef(null);
@@ -260,16 +261,20 @@ export default function App() {
     if (!inRoom) return;
 
     const { cleanRoom, cleanPass, fullRoomKey } = parseRoomInput(roomName, roomPassword);
-    setParticipants([{ id: 'local-me', nick: nickname }]);
+    const cid = persistentClientIdRef.current;
+    setParticipants([{ id: cid, nick: nickname }]);
 
     let isUnmounted = false;
     let controlWs = null;
     let mediaWs = null;
     let fallbackSocket = null;
+    let heartbeatTimer = null;
+    let controlReconnectTimer = null;
+    let mediaReconnectTimer = null;
 
     const onRoomUsers = (list) => {
       if (isUnmounted) return;
-      setParticipants(list && list.length ? list : [{ id: 'local-me', nick: nickname }]);
+      setParticipants(list && list.length ? list : [{ id: cid, nick: nickname }]);
     };
 
     const onActiveStreams = (list) => {
@@ -283,6 +288,7 @@ export default function App() {
           if (!st || !st.streamId) return;
           if (
             st.senderId === myIdRef.current ||
+            st.senderId === cid ||
             localStreamIdsRef.current.has(st.streamId) ||
             localOnes.some(l => l.id === st.streamId)
           ) {
@@ -323,7 +329,7 @@ export default function App() {
 
     const onStreamStarted = (st) => {
       if (isUnmounted || !st || !st.streamId) return;
-      if (st.senderId === myIdRef.current || localStreamIdsRef.current.has(st.streamId)) return;
+      if (st.senderId === myIdRef.current || st.senderId === cid || localStreamIdsRef.current.has(st.streamId)) return;
 
       stoppedWatchingSetRef.current.delete(st.streamId);
 
@@ -360,7 +366,7 @@ export default function App() {
 
     const onVChunk = (meta, buffer) => {
       if (isUnmounted || !meta || !meta.id) return;
-      if (meta.senderId === myIdRef.current || localStreamIdsRef.current.has(meta.id)) return;
+      if (meta.senderId === myIdRef.current || meta.senderId === cid || localStreamIdsRef.current.has(meta.id)) return;
 
       setStreams(prev => {
         if (prev.some(s => s.id === meta.id)) return prev;
@@ -421,86 +427,151 @@ export default function App() {
     };
 
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const controlUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=control`;
-    const mediaUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=media`;
+    const controlUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=control&cid=${encodeURIComponent(cid)}`;
+    const mediaUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=media&cid=${encodeURIComponent(cid)}`;
 
-    let cfConnected = false;
-    try {
-      controlWs = new WebSocket(controlUrl);
-      mediaWs = new WebSocket(mediaUrl);
-      mediaWs.binaryType = 'arraybuffer';
+    let cfEverConnected = false;
 
-      controlWs.onopen = () => {
-        if (isUnmounted) return;
-        cfConnected = true;
-        transportRef.current = {
-          mode: 'cf-ws',
-          sendControl: (type, payload = {}) => {
-            if (controlWs && controlWs.readyState === 1) {
-              controlWs.send(JSON.stringify({ type, ...payload }));
-            }
-          },
-          // IMPORTANTE: Nunca descarta um frame DEPOIS do encoder (para não quebrar a cadeia de P-frames)!
-          sendVideoChunk: (meta, buffer) => {
-            if (mediaWs && mediaWs.readyState === 1) {
-              mediaWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
-            }
-          },
-          sendAudioChunk: (meta, buffer) => {
-            if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 524288) {
-              mediaWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
-            }
-          },
-          getBufferedAmount: () => (mediaWs ? mediaWs.bufferedAmount : 0)
+    const connectControlWs = () => {
+      if (isUnmounted || fallbackSocket) return;
+      try {
+        if (controlWs) {
+          controlWs.onclose = null;
+          controlWs.onerror = null;
+          try { controlWs.close(); } catch (e) {}
+        }
+        controlWs = new WebSocket(controlUrl);
+
+        controlWs.onopen = () => {
+          if (isUnmounted) return;
+          cfEverConnected = true;
+          controlWs.send(JSON.stringify({
+            type: 'join-room',
+            clientId: cid,
+            roomName: cleanRoom,
+            roomPassword: cleanPass,
+            nickname
+          }));
+
+          // Se já estávamos transmitindo antes da reconexão, reanuncia nossa live automaticamente sem interromper!
+          activeLocalMetasRef.current.forEach((meta) => {
+            controlWs.send(JSON.stringify({ type: 'start-stream', meta }));
+          });
         };
 
-        controlWs.send(JSON.stringify({
-          type: 'join-room',
-          roomName: cleanRoom,
-          roomPassword: cleanPass,
-          nickname
-        }));
-      };
+        controlWs.onmessage = (event) => {
+          if (isUnmounted || event.data instanceof ArrayBuffer) return;
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'pong') return;
+            if (data.type === 'welcome') {
+              myIdRef.current = data.id;
+              setMyId(data.id);
+            } else if (data.type === 'room-users') {
+              onRoomUsers(data.users);
+            } else if (data.type === 'active-streams') {
+              onActiveStreams(data.streams);
+            } else if (data.type === 'stream-started') {
+              onStreamStarted(data.stream);
+            } else if (data.type === 'force-keyframe') {
+              Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+            } else if (data.type === 'peer-stopped-stream') {
+              onPeerStoppedStream(data.streamId);
+            } else if (data.type === 'chat-message') {
+              onChatMessage(data.msg);
+            }
+          } catch (e) {}
+        };
 
-      controlWs.onmessage = (event) => {
-        if (isUnmounted || event.data instanceof ArrayBuffer) return;
-        const data = JSON.parse(event.data);
-        if (data.type === 'welcome') {
-          myIdRef.current = data.id;
-          setMyId(data.id);
-        } else if (data.type === 'room-users') {
-          onRoomUsers(data.users);
-        } else if (data.type === 'active-streams') {
-          onActiveStreams(data.streams);
-        } else if (data.type === 'stream-started') {
-          onStreamStarted(data.stream);
-        } else if (data.type === 'force-keyframe') {
-          Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
-        } else if (data.type === 'peer-stopped-stream') {
-          onPeerStoppedStream(data.streamId);
-        } else if (data.type === 'chat-message') {
-          onChatMessage(data.msg);
+        controlWs.onclose = () => {
+          if (isUnmounted) return;
+          if (!cfEverConnected && !fallbackSocket) {
+            startSocketIoFallback();
+          } else if (cfEverConnected) {
+            // RECONEXÃO AUTOMÁTICA EM 400ms (Nunca derruba o usuário da sala!)
+            clearTimeout(controlReconnectTimer);
+            controlReconnectTimer = setTimeout(connectControlWs, 400);
+          }
+        };
+
+        controlWs.onerror = () => {
+          if (!cfEverConnected && !fallbackSocket && !isUnmounted) {
+            startSocketIoFallback();
+          }
+        };
+      } catch (e) {
+        if (!cfEverConnected) startSocketIoFallback();
+      }
+    };
+
+    const connectMediaWs = () => {
+      if (isUnmounted || fallbackSocket) return;
+      try {
+        if (mediaWs) {
+          mediaWs.onclose = null;
+          mediaWs.onerror = null;
+          try { mediaWs.close(); } catch (e) {}
         }
-      };
+        mediaWs = new WebSocket(mediaUrl);
+        mediaWs.binaryType = 'arraybuffer';
 
-      mediaWs.onmessage = (event) => {
-        if (isUnmounted || !(event.data instanceof ArrayBuffer)) return;
-        try {
-          const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
-          if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
-          else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
-        } catch (e) {}
-      };
+        mediaWs.onopen = () => {
+          if (isUnmounted) return;
+          cfEverConnected = true;
+          Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
+        };
 
-      controlWs.onerror = () => {
-        if (!cfConnected && !fallbackSocket && !isUnmounted) startSocketIoFallback();
-      };
-      controlWs.onclose = () => {
-        if (!cfConnected && !fallbackSocket && !isUnmounted) startSocketIoFallback();
-      };
-    } catch (e) {
-      startSocketIoFallback();
-    }
+        mediaWs.onmessage = (event) => {
+          if (isUnmounted || !(event.data instanceof ArrayBuffer)) return;
+          try {
+            const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
+            if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
+            else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
+          } catch (e) {}
+        };
+
+        mediaWs.onclose = () => {
+          if (isUnmounted) return;
+          if (cfEverConnected) {
+            clearTimeout(mediaReconnectTimer);
+            mediaReconnectTimer = setTimeout(connectMediaWs, 400);
+          }
+        };
+      } catch (e) {}
+    };
+
+    transportRef.current = {
+      mode: 'cf-ws',
+      sendControl: (type, payload = {}) => {
+        if (controlWs && controlWs.readyState === 1) {
+          controlWs.send(JSON.stringify({ type, ...payload }));
+        }
+      },
+      sendVideoChunk: (meta, buffer) => {
+        if (mediaWs && mediaWs.readyState === 1) {
+          mediaWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
+        }
+      },
+      sendAudioChunk: (meta, buffer) => {
+        if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 524288) {
+          mediaWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
+        }
+      },
+      getBufferedAmount: () => (mediaWs ? mediaWs.bufferedAmount : 0)
+    };
+
+    connectControlWs();
+    connectMediaWs();
+
+    // Heartbeat a cada 15 segundos nos DOIS sockets: impede o timeout de 100s/5min da Cloudflare!
+    heartbeatTimer = setInterval(() => {
+      if (controlWs && controlWs.readyState === 1) {
+        try { controlWs.send('ping'); } catch (e) {}
+      }
+      if (mediaWs && mediaWs.readyState === 1) {
+        try { mediaWs.send('ping'); } catch (e) {}
+      }
+    }, 15000);
 
     function startSocketIoFallback() {
       if (isUnmounted || fallbackSocket) return;
@@ -536,6 +607,9 @@ export default function App() {
           roomPassword: cleanPass,
           nickname
         });
+        activeLocalMetasRef.current.forEach((meta) => {
+          socket.emit('start-stream', meta);
+        });
       });
 
       socket.on('room-users', (list) => onRoomUsers(list));
@@ -552,10 +626,13 @@ export default function App() {
 
     return () => {
       isUnmounted = true;
+      clearInterval(heartbeatTimer);
+      clearTimeout(controlReconnectTimer);
+      clearTimeout(mediaReconnectTimer);
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
       Object.values(ramClipBuffersRef.current).forEach(b => b.clear?.());
-      try { if (controlWs) controlWs.close(); } catch (e) {}
-      try { if (mediaWs) mediaWs.close(); } catch (e) {}
+      try { if (controlWs) { controlWs.onclose = null; controlWs.close(); } } catch (e) {}
+      try { if (mediaWs) { mediaWs.onclose = null; mediaWs.close(); } } catch (e) {}
       try { if (fallbackSocket) fallbackSocket.disconnect(); } catch (e) {}
     };
   }, [inRoom, roomName, roomPassword, nickname]);
@@ -661,7 +738,7 @@ export default function App() {
     const configureEncoderNow = async (rawW, rawH) => {
       const cfg = RES_CONFIG[qualityRef.current] || RES_CONFIG['1080p'];
       const targetFps = Number(fpsRef.current) || 60;
-      const targetBitrateBps = (Number(bitrateKbpsRef.current) || 8000) * 1000;
+      const targetBitrateBps = (Number(bitrateKbpsRef.current) || 4000) * 1000;
       const ratio = rawW && rawH ? rawW / rawH : 16 / 9;
       targetH = Math.min(cfg.height, rawH || cfg.height);
       targetW = Math.round(targetH * ratio);
@@ -698,7 +775,7 @@ export default function App() {
           },
           error: () => {}
         });
-        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 96000 });
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 64000 });
 
         let usingDesktopWasapi = false;
         try {
@@ -787,11 +864,9 @@ export default function App() {
 
           const now = performance.now();
           const minInterval = 1000 / (Number(fpsRef.current) + 2);
-          // Permite até 1.5 MB de rajada para comportar Keyframes de 8000–12000 kbps sem cortar frames!
-          const netBusy = transportRef.current.getBufferedAmount() > 1572864;
+          const netBusy = transportRef.current.getBufferedAmount() > 524288;
 
-          if (now - lastFrameTime < minInterval || videoEncoder.encodeQueueSize > 3 || netBusy) {
-            // Pular um frame ANTES do encoder NÃO corrompe a referência P-frame! Nunca forçar Keyframe aqui!
+          if (now - lastFrameTime < minInterval || videoEncoder.encodeQueueSize > 2 || netBusy) {
             frame.close();
             continue;
           }
@@ -799,8 +874,8 @@ export default function App() {
 
           try {
             if (videoEncoder.state === 'configured') {
-              // Keyframe apenas a cada 180 frames (3s em 60fps) ou quando solicitado com cooldown de 1.5s
-              const isKey = forceKey || (frameCount % 180 === 0);
+              // Keyframe a cada 240 frames (4s) para evitar picos de tráfego na Cloudflare
+              const isKey = forceKey || (frameCount % 240 === 0);
               if (isKey) {
                 forceKey = false;
                 lastKeyframeTs = now;
@@ -819,7 +894,7 @@ export default function App() {
     activeEncodersRef.current[streamId] = {
       forceKey: () => {
         const now = performance.now();
-        if (now - lastKeyframeTs > 1200) {
+        if (now - lastKeyframeTs > 1500) {
           forceKey = true;
         }
       },
@@ -896,6 +971,7 @@ export default function App() {
         fps: targetFps
       };
 
+      activeLocalMetasRef.current.set(newId, meta);
       transportRef.current.sendControl('start-stream', { meta, ...meta });
       await startWebCodecsSender(newId, mediaStream, false);
     } catch (err) {}
@@ -941,6 +1017,7 @@ export default function App() {
         fps: Number(fps)
       };
 
+      activeLocalMetasRef.current.set(newId, meta);
       transportRef.current.sendControl('start-stream', { meta, ...meta });
       await startWebCodecsSender(newId, mediaStream, true);
     } catch (err) {
@@ -950,6 +1027,7 @@ export default function App() {
 
   const stopStream = (streamId) => {
     localStreamIdsRef.current.delete(streamId);
+    activeLocalMetasRef.current.delete(streamId);
     activeEncodersRef.current[streamId]?.stop?.();
     delete activeEncodersRef.current[streamId];
     ramClipBuffersRef.current[streamId]?.clear?.();
@@ -1116,17 +1194,16 @@ export default function App() {
             <option value="1440p">2K (1440p)</option>
           </select>
 
-          {/* Seletor de Bitrate Direto (Padrão 8000 kbps igual OBS / salinha.live) */}
           <select
             value={bitrateKbps}
             onChange={e => setBitrateKbps(Number(e.target.value))}
-            className="bg-[#171B24] border border-red-500/40 text-xs text-red-300 font-semibold rounded-md px-2.5 py-1.5 cursor-pointer"
-            title="Taxa de Bits da Transmissão (Bitrate)"
+            className="bg-[#171B24] border border-emerald-500/40 text-xs text-emerald-300 font-semibold rounded-md px-2.5 py-1.5 cursor-pointer"
+            title="Taxa de Bits Inteligente (VBR)"
           >
-            <option value={4000}>4000 kbps (4 Mbps)</option>
-            <option value={6000}>6000 kbps (6 Mbps)</option>
-            <option value={8000}>8000 kbps (8K Bitrate · OBS)</option>
-            <option value={12000}>12000 kbps (12 Mbps Ultra)</option>
+            <option value={2500}>2500 kbps (Econômico)</option>
+            <option value={4000}>4000 kbps (VBR HD · Estável)</option>
+            <option value={6000}>6000 kbps (VBR Ultra)</option>
+            <option value={8000}>8000 kbps (8K Máximo)</option>
           </select>
 
           <select value={fps} onChange={e => setFps(Number(e.target.value))} className="bg-[#171B24] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
@@ -1285,7 +1362,7 @@ export default function App() {
                 <div>
                   <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (Placa de Vídeo)</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="H264">H.264 High Profile (NVENC · 8000 kbps)</option>
+                    <option value="H264">H.264 High Profile VBR (NVENC)</option>
                     <option value="VP9">VP9 Alta Nitidez</option>
                     <option value="VP8">VP8 Rápido</option>
                   </select>
@@ -1413,7 +1490,7 @@ export default function App() {
               </div>
               <div className="space-y-1.5">
                 {participants.map(p => {
-                  const isMe = p.id === myId || p.id === 'local-me';
+                  const isMe = p.id === myId || p.id === persistentClientIdRef.current;
                   const userStreams = isMe
                     ? streams.filter(s => s.isLocal)
                     : streams.filter(s => !s.isLocal && ((s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)));
@@ -1595,7 +1672,7 @@ function ReplayPlayerModal({ replayModal, watchingStreams, onSelectStream, onClo
     const durationMs = Math.min(30000, Math.max(2000, chunks[chunks.length - 1].arrivedAt - chunks[0].arrivedAt));
     const stream = canvas.captureStream(30);
     const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
-    const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 6000000 });
+    const rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 5000000 });
     const parts = [];
 
     rec.ondataavailable = (e) => {
@@ -1733,7 +1810,6 @@ function VideoTile({
     localVideoRef.current.play().catch(() => {});
   }, [streamObj.isLocal, streamObj.stream]);
 
-  // Decodificador Remoto Contínuo (Sem reset de decodeQueueSize > 3 que causava engasgos!)
   useEffect(() => {
     if (streamObj.isLocal) return;
 
@@ -1752,7 +1828,7 @@ function VideoTile({
 
     const requestKeyThrottled = () => {
       const now = Date.now();
-      if (now - lastKeyReqTime > 1200) {
+      if (now - lastKeyReqTime > 1500) {
         lastKeyReqTime = now;
         onRequestKeyframe?.();
       }

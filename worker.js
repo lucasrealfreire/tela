@@ -4,6 +4,7 @@ export class RoomDO {
     this.controlSessions = new Map(); // ws -> { id, nick }
     this.mediaSessions = new Set();   // ws exclusivos de vídeo/áudio
     this.activeStreams = new Map();   // streamId -> meta
+    this.disconnectTimers = new Map(); // clientId -> timeoutId
   }
 
   async fetch(request) {
@@ -19,7 +20,7 @@ export class RoomDO {
     const [client, server] = Object.values(pair);
     server.accept();
 
-    // Canal separado exclusivo para mídia binária (não bloqueia o chat nem atrasa pacotes)
+    // Canal de mídia binária com suporte a keep-alive
     if (role === 'media') {
       this.mediaSessions.add(server);
       server.addEventListener('message', (event) => {
@@ -29,6 +30,8 @@ export class RoomDO {
               try { ws.send(event.data); } catch (e) {}
             }
           }
+        } else if (event.data === 'ping') {
+          try { server.send('pong'); } catch (e) {}
         }
       });
       const cleanMedia = () => this.mediaSessions.delete(server);
@@ -37,9 +40,9 @@ export class RoomDO {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // Canal exclusivo de Controle e Chat (0ms de fila)
-    const socketId = crypto.randomUUID();
-    this.controlSessions.set(server, { id: socketId, nick: 'Conectando...' });
+    // Canal de Controle e Chat com ID persistente (não derruba na reconexão!)
+    let clientId = url.searchParams.get('cid') || crypto.randomUUID();
+    this.controlSessions.set(server, { id: clientId, nick: 'Conectando...' });
 
     const broadcastControl = (obj, excludeWs = null) => {
       const str = JSON.stringify(obj);
@@ -50,20 +53,45 @@ export class RoomDO {
       }
     };
 
+    const getUniqueUsers = () => {
+      const map = new Map();
+      for (const u of this.controlSessions.values()) {
+        if (u && u.id && u.nick !== 'Conectando...') {
+          map.set(u.id, u);
+        }
+      }
+      return Array.from(map.values());
+    };
+
     const broadcastUsers = () => {
-      const list = Array.from(this.controlSessions.values());
-      broadcastControl({ type: 'room-users', users: list });
+      broadcastControl({ type: 'room-users', users: getUniqueUsers() });
     };
 
     server.addEventListener('message', (event) => {
       try {
         if (event.data instanceof ArrayBuffer) return;
+        if (event.data === 'ping') {
+          server.send(JSON.stringify({ type: 'pong' }));
+          return;
+        }
+
         const data = JSON.parse(event.data);
+        if (data.type === 'ping') {
+          server.send(JSON.stringify({ type: 'pong' }));
+          return;
+        }
 
         if (data.type === 'join-room') {
+          if (data.clientId) clientId = String(data.clientId).slice(0, 40);
+          // Cancela qualquer timer de desconexão pendente deste usuário (reconexão transparente!)
+          if (this.disconnectTimers.has(clientId)) {
+            clearTimeout(this.disconnectTimers.get(clientId));
+            this.disconnectTimers.delete(clientId);
+          }
+
           const cleanNick = String(data.nickname || 'usuario').trim().slice(0, 24);
-          this.controlSessions.set(server, { id: socketId, nick: cleanNick });
-          server.send(JSON.stringify({ type: 'welcome', id: socketId }));
+          this.controlSessions.set(server, { id: clientId, nick: cleanNick });
+          server.send(JSON.stringify({ type: 'welcome', id: clientId }));
           broadcastUsers();
 
           const currentStreams = Array.from(this.activeStreams.values());
@@ -72,11 +100,13 @@ export class RoomDO {
             broadcastControl({ type: 'force-keyframe' }, server);
           }
         } else if (data.type === 'start-stream') {
-          for (const [sId, sMeta] of this.activeStreams.entries()) {
-            if (sMeta.senderId === socketId) this.activeStreams.delete(sId);
-          }
           const metaObj = data.meta || data;
-          const streamData = { ...metaObj, senderId: socketId };
+          for (const [sId, sMeta] of this.activeStreams.entries()) {
+            if (sMeta.senderId === clientId && sId !== metaObj.streamId) {
+              this.activeStreams.delete(sId);
+            }
+          }
+          const streamData = { ...metaObj, senderId: clientId };
           this.activeStreams.set(streamData.streamId, streamData);
           broadcastControl({ type: 'active-streams', streams: Array.from(this.activeStreams.values()) });
           broadcastControl({ type: 'stream-started', stream: streamData }, server);
@@ -89,7 +119,7 @@ export class RoomDO {
         } else if (data.type === 'chat-message') {
           const sender = this.controlSessions.get(server);
           const rawText = data.msg?.text || data.text || '';
-          if (! String(rawText).trim()) return;
+          if (!String(rawText).trim()) return;
           const msgPayload = {
             id: data.msg?.id || `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             sender: sender?.nick || data.msg?.sender || 'Participante',
@@ -103,14 +133,36 @@ export class RoomDO {
 
     const cleanup = () => {
       this.controlSessions.delete(server);
-      for (const [sId, sMeta] of this.activeStreams.entries()) {
-        if (sMeta.senderId === socketId) {
-          this.activeStreams.delete(sId);
-          broadcastControl({ type: 'peer-stopped-stream', streamId: sId });
+      // Verifica se o mesmo usuário já não está conectado em outro socket ativo
+      let stillConnected = false;
+      for (const u of this.controlSessions.values()) {
+        if (u.id === clientId) {
+          stillConnected = true;
+          break;
         }
       }
-      broadcastControl({ type: 'active-streams', streams: Array.from(this.activeStreams.values()) });
-      broadcastUsers();
+      if (stillConnected) return;
+
+      // Aguarda 6 segundos antes de remover o usuário/stream (permite reconexão automática sem kickar ninguém!)
+      const timer = setTimeout(() => {
+        this.disconnectTimers.delete(clientId);
+        let reconnected = false;
+        for (const u of this.controlSessions.values()) {
+          if (u.id === clientId) { reconnected = true; break; }
+        }
+        if (reconnected) return;
+
+        for (const [sId, sMeta] of this.activeStreams.entries()) {
+          if (sMeta.senderId === clientId) {
+            this.activeStreams.delete(sId);
+            broadcastControl({ type: 'peer-stopped-stream', streamId: sId });
+          }
+        }
+        broadcastControl({ type: 'active-streams', streams: Array.from(this.activeStreams.values()) });
+        broadcastUsers();
+      }, 6000);
+
+      this.disconnectTimers.set(clientId, timer);
     };
 
     server.addEventListener('close', cleanup);
