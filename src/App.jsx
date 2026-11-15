@@ -41,7 +41,6 @@ function parseRoomInput(rawRoom, rawPass) {
   };
 }
 
-// Empacota cabeçalho JSON + ArrayBuffer binário num único frame WebSocket (para o Cloudflare Worker)
 function packBinaryFrame(headerObj, payloadBuffer) {
   const headerBytes = new TextEncoder().encode(JSON.stringify(headerObj));
   const payloadBytes = new Uint8Array(payloadBuffer);
@@ -201,15 +200,22 @@ export default function App() {
     return saved !== null ? Number(saved) : 80;
   });
 
+  // ATIVADO POR PADRÃO: Exclui o áudio do Discord na transmissão (para ninguém ouvir o Discord na sua live, sem mutar para você!)
   const [excludeDiscordAudio, setExcludeDiscordAudio] = useState(() => {
     const saved = localStorage.getItem('tv_exclude_discord');
     return saved !== null ? saved === 'true' : true;
   });
+  const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
+  const [discordIsolatedActive, setDiscordIsolatedActive] = useState(false);
 
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
 
   const [myId, setMyId] = useState('local-me');
+  const myIdRef = useRef('local-me');
+  // Guarda todos os IDs de stream criados localmente para NUNCA duplicar como se fossem remotos!
+  const localStreamIdsRef = useRef(new Set());
+
   const [streams, setStreams] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [participants, setParticipants] = useState([]);
@@ -218,9 +224,8 @@ export default function App() {
   ]);
   const [chatInput, setChatInput] = useState('');
 
-  // Transporte híbrido: funciona com Cloudflare Native WebSocket (/ws) OU com Socket.IO do Render!
   const transportRef = useRef({
-    mode: 'none', // 'cf-ws' ou 'socketio'
+    mode: 'none',
     ws: null,
     socket: null,
     sendControl: () => {},
@@ -238,9 +243,25 @@ export default function App() {
   const qualityRef = useRef(quality);
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
+  const excludeDiscordRef = useRef(excludeDiscordAudio);
   const outgoingVolumeRef = useRef(outgoingVolume);
 
+  // Detecta automaticamente se o VogelsTV.exe (ponte WASAPI Anti-Eco do Discord) está aberto no Windows
   useEffect(() => {
+    const checkBridge = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:19876/ping', { method: 'GET', mode: 'cors' });
+        const data = await res.json();
+        if (data?.ok) setDesktopBridgeActive(true);
+      } catch (e) {}
+    };
+    checkBridge();
+    const timer = setInterval(checkBridge, 3500);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    excludeDiscordRef.current = excludeDiscordAudio;
     localStorage.setItem('tv_exclude_discord', String(excludeDiscordAudio));
   }, [excludeDiscordAudio]);
 
@@ -270,12 +291,10 @@ export default function App() {
     localStorage.setItem('tv_nick', nickname);
   }, [nickname]);
 
-  // Conecta na sala exatamente com a mesma lógica que funcionava no Render!
   useEffect(() => {
     if (!inRoom) return;
 
     const { cleanRoom, cleanPass, fullRoomKey } = parseRoomInput(roomName, roomPassword);
-    // Garante que você mesmo apareça na lista de participantes na mesma hora em que entra
     setParticipants([{ id: 'local-me', nick: nickname }]);
 
     let isUnmounted = false;
@@ -287,15 +306,26 @@ export default function App() {
       setParticipants(list && list.length ? list : [{ id: 'local-me', nick: nickname }]);
     };
 
-    const onActiveStreams = (list, currentSelfId) => {
+    // CORREÇÃO DA DUPLICAÇÃO DE TELA: Filtra estritamente streams locais (via myIdRef e localStreamIdsRef)
+    const onActiveStreams = (list) => {
       if (isUnmounted || !Array.isArray(list)) return;
       setStreams(prev => {
         const localOnes = prev.filter(s => s.isLocal);
+        const remoteOnes = prev.filter(s => !s.isLocal);
         const updatedRemotes = [];
 
         list.forEach(st => {
-          if (st.senderId === currentSelfId) return;
-          const existing = prev.find(p => p.id === st.streamId);
+          if (!st || !st.streamId) return;
+          // NUNCA duplica uma tela que pertence a nós mesmos!
+          if (
+            st.senderId === myIdRef.current ||
+            localStreamIdsRef.current.has(st.streamId) ||
+            localOnes.some(l => l.id === st.streamId)
+          ) {
+            return;
+          }
+
+          const existing = remoteOnes.find(p => p.id === st.streamId);
           if (existing) {
             updatedRemotes.push({
               ...existing,
@@ -327,12 +357,15 @@ export default function App() {
       });
     };
 
-    const onStreamStarted = (st, currentSelfId) => {
-      if (isUnmounted || !st || st.senderId === currentSelfId) return;
+    const onStreamStarted = (st) => {
+      if (isUnmounted || !st || !st.streamId) return;
+      if (st.senderId === myIdRef.current || localStreamIdsRef.current.has(st.streamId)) return;
+
       stoppedWatchingSetRef.current.delete(st.streamId);
 
       setStreams(prev => {
-        const exists = prev.find(s => s.id === st.streamId);
+        if (prev.some(s => s.isLocal && s.id === st.streamId)) return prev;
+        const exists = prev.find(s => !s.isLocal && s.id === st.streamId);
         if (exists) {
           return prev.map(s =>
             s.id === st.streamId
@@ -362,7 +395,9 @@ export default function App() {
     };
 
     const onVChunk = (meta, buffer) => {
-      if (isUnmounted) return;
+      if (isUnmounted || !meta || !meta.id) return;
+      if (meta.senderId === myIdRef.current || localStreamIdsRef.current.has(meta.id)) return;
+
       setStreams(prev => {
         if (prev.some(s => s.id === meta.id)) return prev;
         const isStopped = stoppedWatchingSetRef.current.has(meta.id);
@@ -391,7 +426,8 @@ export default function App() {
     };
 
     const onAChunk = (meta, buffer) => {
-      if (isUnmounted || stoppedWatchingSetRef.current.has(meta.id)) return;
+      if (isUnmounted || !meta || !meta.id) return;
+      if (localStreamIdsRef.current.has(meta.id) || stoppedWatchingSetRef.current.has(meta.id)) return;
       const handler = audioChunkHandlersRef.current[meta.id];
       if (handler) handler(meta, buffer);
     };
@@ -406,7 +442,6 @@ export default function App() {
       delete audioChunkHandlersRef.current[streamId];
     };
 
-    // 1. Tenta conectar primeiro no WebSocket nativo da própria Cloudflare (/ws)
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}`;
 
@@ -458,13 +493,14 @@ export default function App() {
         }
         const data = JSON.parse(event.data);
         if (data.type === 'welcome') {
+          myIdRef.current = data.id;
           setMyId(data.id);
         } else if (data.type === 'room-users') {
           onRoomUsers(data.users);
         } else if (data.type === 'active-streams') {
-          onActiveStreams(data.streams, myId);
+          onActiveStreams(data.streams);
         } else if (data.type === 'stream-started') {
-          onStreamStarted(data.stream, myId);
+          onStreamStarted(data.stream);
         } else if (data.type === 'force-keyframe') {
           Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
         } else if (data.type === 'peer-stopped-stream') {
@@ -489,7 +525,6 @@ export default function App() {
       startSocketIoFallback();
     }
 
-    // 2. Fallback automático para Socket.IO (caso esteja rodando em localhost ou Render)
     function startSocketIoFallback() {
       if (isUnmounted || fallbackSocket) return;
       const targetServer = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
@@ -519,6 +554,7 @@ export default function App() {
       };
 
       socket.on('connect', () => {
+        myIdRef.current = socket.id;
         setMyId(socket.id);
         socket.emit('join-room', {
           roomName: cleanRoom,
@@ -528,8 +564,8 @@ export default function App() {
       });
 
       socket.on('room-users', (list) => onRoomUsers(list));
-      socket.on('active-streams', (list) => onActiveStreams(list, socket.id));
-      socket.on('stream-started', (st) => onStreamStarted(st, socket.id));
+      socket.on('active-streams', (list) => onActiveStreams(list));
+      socket.on('stream-started', (st) => onStreamStarted(st));
       socket.on('force-keyframe', () => {
         Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
       });
@@ -607,7 +643,6 @@ export default function App() {
     }
   };
 
-  // EXATAMENTE o mesmo motor WebCodecs que funcionou no Render!
   const startWebCodecsSender = async (streamId, mediaStream, isCamera = false) => {
     const vTrack = mediaStream.getVideoTracks()[0];
     if (!vTrack) return;
@@ -618,6 +653,7 @@ export default function App() {
     let currentCodecStr = 'vp8';
     let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
+    const abortCtrl = new AbortController();
 
     const videoEncoder = new VideoEncoder({
       output: (chunk) => {
@@ -627,7 +663,7 @@ export default function App() {
 
         transportRef.current.sendVideoChunk({
           id: streamId,
-          senderId: myId,
+          senderId: myIdRef.current,
           owner: nickname,
           c: currentCodecStr,
           t: chunk.type,
@@ -661,9 +697,10 @@ export default function App() {
     const settings = vTrack.getSettings ? vTrack.getSettings() : {};
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
+    // PIPELINE DE ÁUDIO COM ISOLAMENTO DO DISCORD POR PADRÃO:
+    // Se o App Desktop VogelsTV.exe estiver rodando, usa o stream WASAPI que exclui a árvore do Discord.exe da transmissão!
     let audioEncoder = null;
-    const aTrack = mediaStream.getAudioTracks()[0];
-    if (!isCamera && aTrack && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window) {
+    if (!isCamera && 'AudioEncoder' in window) {
       try {
         audioEncoder = new AudioEncoder({
           output: (chunk) => {
@@ -681,16 +718,79 @@ export default function App() {
           error: () => {}
         });
         audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
-        const aProc = new MediaStreamTrackProcessor({ track: aTrack });
-        const aReader = aProc.readable.getReader();
-        (async () => {
-          while (running) {
-            const { value: aData, done } = await aReader.read();
-            if (done || !aData) break;
-            if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
-            aData.close();
+
+        let usingDesktopWasapi = false;
+        try {
+          const excludeFlag = excludeDiscordRef.current ? 1 : 0;
+          const response = await fetch(`http://127.0.0.1:19876/clean-audio?exclude=${excludeFlag}`, {
+            signal: abortCtrl.signal
+          });
+          if (response.ok && response.body) {
+            usingDesktopWasapi = true;
+            setDesktopBridgeActive(true);
+            setDiscordIsolatedActive(excludeDiscordRef.current);
+
+            // Desativa a trilha de áudio bruta da tela para que o áudio do Discord NÃO vaze na transmissão!
+            mediaStream.getAudioTracks().forEach(t => {
+              t.enabled = false;
+              t.stop();
+            });
+
+            const reader = response.body.getReader();
+            let leftover = new Uint8Array(0);
+            const frameBytes = 960 * 4;
+            let timestampUs = 0;
+
+            (async () => {
+              while (running) {
+                const { value, done } = await reader.read();
+                if (done || !value) break;
+
+                const combined = new Uint8Array(leftover.length + value.length);
+                combined.set(leftover, 0);
+                combined.set(value, leftover.length);
+
+                let offset = 0;
+                while (offset + frameBytes <= combined.length) {
+                  const slice = combined.subarray(offset, offset + frameBytes);
+                  offset += frameBytes;
+
+                  if (audioEncoder.state === 'configured') {
+                    const ad = new AudioData({
+                      format: 's16',
+                      sampleRate: 48000,
+                      numberOfFrames: 960,
+                      numberOfChannels: 2,
+                      timestamp: timestampUs,
+                      data: slice
+                    });
+                    audioEncoder.encode(ad);
+                    ad.close();
+                    timestampUs += 20000;
+                  }
+                }
+                leftover = combined.slice(offset);
+              }
+            })().catch(() => {});
           }
-        })().catch(() => {});
+        } catch (e) {}
+
+        // Fallback caso o usuário esteja apenas no navegador sem o VogelsTV.exe aberto
+        if (!usingDesktopWasapi) {
+          const aTrack = mediaStream.getAudioTracks()[0];
+          if (aTrack && 'MediaStreamTrackProcessor' in window) {
+            const aProc = new MediaStreamTrackProcessor({ track: aTrack });
+            const aReader = aProc.readable.getReader();
+            (async () => {
+              while (running) {
+                const { value: aData, done } = await aReader.read();
+                if (done || !aData) break;
+                if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
+                aData.close();
+              }
+            })().catch(() => {});
+          }
+        }
       } catch (e) {}
     }
 
@@ -744,6 +844,8 @@ export default function App() {
       },
       stop: () => {
         running = false;
+        abortCtrl.abort();
+        setDiscordIsolatedActive(false);
         try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
         try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch (e) {}
       }
@@ -752,6 +854,9 @@ export default function App() {
 
   const handleShareScreen = async () => {
     try {
+      // Se já houver um compartilhamento de tela local aberto, encerra-o antes para nunca duplicar
+      streams.filter(s => s.isLocal && s.type !== 'Câmera').forEach(s => stopStream(s.id));
+
       const cfg = RES_CONFIG[quality] || RES_CONFIG['1080p'];
       const targetFps = Number(fps);
 
@@ -777,11 +882,12 @@ export default function App() {
       }
 
       const newId = 'stream_' + Math.random().toString(36).substring(2, 9);
+      localStreamIdsRef.current.add(newId);
       vTrack.onended = () => stopStream(newId);
 
       const newStreamObj = {
         id: newId,
-        senderId: myId,
+        senderId: myIdRef.current,
         owner: nickname,
         type: gameMode ? 'Modo Jogo' : 'Tela',
         stream: mediaStream,
@@ -795,11 +901,11 @@ export default function App() {
         isLocal: true
       };
 
-      setStreams(prev => [...prev, newStreamObj]);
+      setStreams(prev => [...prev.filter(s => !(s.isLocal && s.type !== 'Câmera')), newStreamObj]);
 
       const meta = {
         streamId: newId,
-        senderId: myId,
+        senderId: myIdRef.current,
         owner: nickname,
         type: newStreamObj.type,
         res: cfg.label,
@@ -818,17 +924,20 @@ export default function App() {
 
   const handleShareCamera = async () => {
     try {
+      streams.filter(s => s.isLocal && s.type === 'Câmera').forEach(s => stopStream(s.id));
+
       const mediaStream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: Number(fps) } },
         audio: false
       });
       const newId = 'cam_' + Math.random().toString(36).substring(2, 9);
+      localStreamIdsRef.current.add(newId);
       const vTrack = mediaStream.getVideoTracks()[0];
       vTrack.onended = () => stopStream(newId);
 
       const newStreamObj = {
         id: newId,
-        senderId: myId,
+        senderId: myIdRef.current,
         owner: nickname,
         type: 'Câmera',
         stream: mediaStream,
@@ -842,11 +951,11 @@ export default function App() {
         isLocal: true
       };
 
-      setStreams(prev => [...prev, newStreamObj]);
+      setStreams(prev => [...prev.filter(s => !(s.isLocal && s.type === 'Câmera')), newStreamObj]);
 
       const meta = {
         streamId: newId,
-        senderId: myId,
+        senderId: myIdRef.current,
         owner: nickname,
         type: 'Câmera',
         res: '720p',
@@ -866,6 +975,7 @@ export default function App() {
   };
 
   const stopStream = (streamId) => {
+    localStreamIdsRef.current.delete(streamId);
     activeEncodersRef.current[streamId]?.stop?.();
     delete activeEncodersRef.current[streamId];
     clipManagersRef.current[streamId]?.destroy?.();
@@ -920,29 +1030,6 @@ export default function App() {
     }
   };
 
-  // Cria um Atalho Nativo do Windows (.url) / App Mode que o Google Chrome e o Windows NUNCA bloqueiam como vírus!
-  const downloadSafeDesktopApp = () => {
-    const { cleanRoom, cleanPass } = parseRoomInput(roomName, roomPassword);
-    const targetUrl = `${window.location.origin}/?desktop=1&sala=${encodeURIComponent(cleanRoom)}${cleanPass ? `&senha=${encodeURIComponent(cleanPass)}` : ''}`;
-
-    const shortcutContent = [
-      '[InternetShortcut]',
-      `URL=${targetUrl}`,
-      'IconIndex=18',
-      'IconFile=C:\\Windows\\System32\\shell32.dll'
-    ].join('\r\n');
-
-    const blob = new Blob([shortcutContent], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'VogelsTV Desktop.url';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-  };
-
   const sendChat = (e) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
@@ -963,7 +1050,12 @@ export default function App() {
       <div className="h-screen w-screen bg-[#0D0F13] flex items-center justify-center p-4">
         <div className="w-full max-w-sm bg-[#151922] border border-[#232936] rounded-xl p-6 shadow-2xl">
           <div className="flex items-center justify-between mb-6">
-            <VogelsLogo size="text-2xl" />
+            <VogelsLogo size="text-2xl"/>
+            {desktopBridgeActive && (
+              <span className="text-[11px] bg-emerald-950/60 border border-emerald-700/50 text-emerald-300 px-2 py-0.5 rounded font-medium">
+                App Windows Ativo
+              </span>
+            )}
           </div>
           <form
             onSubmit={(e) => {
@@ -1036,7 +1128,7 @@ export default function App() {
     <div className="h-screen w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col select-none overflow-hidden">
       <header className="h-12 bg-[#12151C] border-b border-[#1E232E] px-3 flex items-center justify-between gap-2 shrink-0 z-20">
         <div className="flex items-center gap-2">
-          <VogelsLogo size="text-base" />
+          <VogelsLogo size="text-base"/>
           <span className="text-amber-400 text-xs">🔒</span>
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-200 px-2 py-0.5 rounded-full font-mono">
             {cleanRoom}
@@ -1044,6 +1136,11 @@ export default function App() {
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-emerald-400 px-2 py-0.5 rounded-full font-medium">
             {participants.length} online
           </span>
+          {discordIsolatedActive && (
+            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full" title="Você ouve o Discord normalmente, mas a voz do Discord não sai na sua transmissão">
+              🛡️ Discord Isolado na Live
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -1198,7 +1295,7 @@ export default function App() {
 
                 <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-white">Remover sons do Discord na live</span>
+                    <span className="text-xs font-semibold text-white">Mutar Discord na stream (Anti-Eco)</span>
                     <input
                       type="checkbox"
                       checked={excludeDiscordAudio}
@@ -1207,7 +1304,7 @@ export default function App() {
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Ativado por padrão: isola o áudio da janela/jogo sem transmitir a voz do Discord para quem assiste.
+                    Vem ativado por padrão no App Baixável: quem assiste à sua live não escuta o seu Discord (evita vozes duplicadas), mas você continua ouvindo seus amigos normalmente.
                   </p>
                 </div>
 
@@ -1232,13 +1329,17 @@ export default function App() {
             )}
           </div>
 
-          <button
-            onClick={downloadSafeDesktopApp}
-            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer"
-            title="Baixar Atalho Oficial VogelsTV (Zero alerta do Chrome/Windows)"
+          <a
+            href="/VogelsTV.exe"
+            download="VogelsTV.exe"
+            onClick={() => {
+              try { navigator.clipboard.writeText(currentRoomUrl); } catch (e) {}
+            }}
+            className="bg-[#2B82F6] hover:bg-[#1D6FE0] text-white font-medium text-xs rounded-md px-3 py-1.5 cursor-pointer inline-flex items-center"
+            title="Baixar aplicativo VogelsTV.exe com isolamento de voz do Discord por padrão"
           >
             Baixar app
-          </button>
+          </a>
 
           <button onClick={copyRoomLink} className="bg-[#171B24] hover:bg-[#1E2330] border border-[#282E3D] text-xs text-gray-200 rounded-md px-2.5 py-1.5 cursor-pointer">
             🔗 Link
@@ -1296,11 +1397,7 @@ export default function App() {
               {watchingStreams
                 .filter(s => !expandedId || s.id === expandedId)
                 .map(streamObj => (
-                  <VideoTile
-                    key={`${streamObj.id}_${streamObj.watchSession || 1}`}
-                    streamObj={streamObj}
-                    masterVolume={masterVolume}
-                    onRequestKeyframe={() => transportRef.current.sendControl('request-keyframe', { streamId: streamObj.id })}
+                  <VideoTile 1}`} key="{`${streamObj.id}_${streamObj.watchSession" masterVolume="{masterVolume}" onRequestKeyframe="{()" streamObj="{streamObj}" ||> transportRef.current.sendControl('request-keyframe', { streamId: streamObj.id })}
                     videoChunkHandlersRef={videoChunkHandlersRef}
                     audioChunkHandlersRef={audioChunkHandlersRef}
                     clipManagersRef={clipManagersRef}
@@ -1331,7 +1428,7 @@ export default function App() {
           )}
 
           <div className="absolute bottom-1.5 left-3 text-[11px] opacity-60 pointer-events-none">
-            <VogelsLogo size="text-xs" />
+            <VogelsLogo size="text-xs"/>
           </div>
         </main>
 
@@ -1350,9 +1447,9 @@ export default function App() {
               <div className="space-y-1.5">
                 {participants.map(p => {
                   const isMe = p.id === myId || p.id === 'local-me';
-                  const userStreams = streams.filter(
-                    s => (s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)
-                  );
+                  const userStreams = isMe
+                    ? streams.filter(s => s.isLocal)
+                    : streams.filter(s => !s.isLocal && ((s.senderId && s.senderId === p.id) || (!s.senderId && s.owner === p.nick)));
                   const hasActiveStream = userStreams.length > 0;
                   const isCurrentlyWatching = userStreams.some(s => s.watching !== false);
 

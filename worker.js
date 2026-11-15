@@ -1,8 +1,8 @@
 export class RoomDO {
   constructor(state, env) {
     this.state = state;
-    this.sessions = new Map(); // ws -> { id, nick }
-    this.activeStreams = new Map(); // streamId -> meta
+    this.sessions = new Map();
+    this.activeStreams = new Map();
   }
 
   async fetch(request) {
@@ -34,7 +34,6 @@ export class RoomDO {
 
     server.addEventListener('message', (event) => {
       try {
-        // Se for pacote BINÁRIO de vídeo ou áudio (WebCodecs GPU igual ao da Render), retransmite em binário puro na hora!
         if (event.data instanceof ArrayBuffer) {
           for (const [ws] of this.sessions.entries()) {
             if (ws !== server && ws.readyState === 1) {
@@ -58,6 +57,12 @@ export class RoomDO {
             broadcastJson({ type: 'force-keyframe' }, server);
           }
         } else if (data.type === 'start-stream') {
+          // Remove qualquer stream anterior do mesmo remetente para nunca duplicar
+          for (const [sId, sMeta] of this.activeStreams.entries()) {
+            if (sMeta.senderId === socketId) {
+              this.activeStreams.delete(sId);
+            }
+          }
           const streamData = { ...data.meta, senderId: socketId };
           this.activeStreams.set(data.meta.streamId, streamData);
           broadcastJson({ type: 'active-streams', streams: Array.from(this.activeStreams.values()) });
@@ -107,7 +112,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Rota de WebSocket de Tempo Real na Cloudflare (/ws?room=...)
     if (url.pathname === '/ws') {
       const roomKey = (url.searchParams.get('room') || 'squad-brasil').toLowerCase().slice(0, 60);
       const id = env.ROOMS.idFromName(roomKey);
@@ -115,7 +119,15 @@ export default {
       return stub.fetch(request);
     }
 
-    // Serve os arquivos estáticos do React (dist/)
+    if (url.pathname === '/VogelsTV.exe' || url.pathname === '/api/download-app') {
+      const assetReq = new Request(new URL('/VogelsTV.exe', request.url), request);
+      const res = await env.ASSETS.fetch(assetReq);
+      const headers = new Headers(res.headers);
+      headers.set('Content-Type', 'application/octet-stream');
+      headers.set('Content-Disposition', 'attachment; filename="VogelsTV.exe"');
+      return new Response(res.body, { status: res.status, headers });
+    }
+
     return env.ASSETS.fetch(request);
   }
 };
