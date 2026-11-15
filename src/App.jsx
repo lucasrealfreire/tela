@@ -52,13 +52,13 @@ export default function App() {
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [replayClipUrl, setReplayClipUrl] = useState(null);
 
-  // Opção ATIVADA POR PADRÃO para mutar o Discord por completo ao compartilhar a tela
-  const [muteDiscordOnShare, setMuteDiscordOnShare] = useState(() => {
-    const saved = localStorage.getItem('tv_mute_discord');
+  // Opção ATIVADA POR PADRÃO: Exclui o áudio do Discord da transmissão (sem mutar no fone de quem streama!)
+  const [excludeDiscordAudio, setExcludeDiscordAudio] = useState(() => {
+    const saved = localStorage.getItem('tv_exclude_discord');
     return saved !== null ? saved === 'true' : true;
   });
   const [desktopBridgeActive, setDesktopBridgeActive] = useState(false);
-  const [discordCurrentlyMuted, setDiscordCurrentlyMuted] = useState(false);
+  const [discordIsolatedActive, setDiscordIsolatedActive] = useState(false);
 
   const [codec, setCodec] = useState('VP8');
   const [clipConfig, setClipConfig] = useState('720p');
@@ -83,55 +83,31 @@ export default function App() {
   const qualityRef = useRef(quality);
   const fpsRef = useRef(fps);
   const codecRef = useRef(codec);
+  const excludeDiscordRef = useRef(excludeDiscordAudio);
 
   const addLog = (msg) => {
     const time = new Date().toLocaleTimeString('pt-BR');
     setLogs(prev => [`[${time}] ${msg}`, ...prev.slice(0, 120)]);
   };
 
-  // Comunica com o processo nativo Windows (TelinhaVogels.exe na porta local 19876) para mutar/desmutar o Discord.exe
-  const setWindowsDiscordMute = async (shouldMute) => {
-    try {
-      const res = await fetch(`http://127.0.0.1:19876/discord-mute?mute=${shouldMute ? 1 : 0}`, {
-        method: 'GET',
-        mode: 'cors'
-      });
-      const data = await res.json();
-      if (data && data.ok) {
-        setDesktopBridgeActive(true);
-        setDiscordCurrentlyMuted(Boolean(data.discordMuted));
-        addLog(
-          shouldMute
-            ? `App Desktop: Discord.exe mutado automaticamente (${data.sessions} sessões WASAPI) para evitar duplicação de voz.`
-            : `App Desktop: Áudio do Discord.exe restaurado.`
-        );
-      }
-    } catch (e) {
-      // Usuário está rodando apenas pelo navegador comum sem o executável aberto
-    }
-  };
-
-  // Detecta se está rodando dentro do Executável Desktop Windows
   useEffect(() => {
     const checkBridge = async () => {
       try {
         const res = await fetch('http://127.0.0.1:19876/ping', { method: 'GET', mode: 'cors' });
         const data = await res.json();
-        if (data?.ok) setDesktopBridgeActive(true);
+        if (data?.ok) {
+          setDesktopBridgeActive(true);
+          addLog('App Desktop Windows detectado: Captura WASAPI Anti-Eco do Discord pronta.');
+        }
       } catch (e) {}
     };
     checkBridge();
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('tv_mute_discord', String(muteDiscordOnShare));
-    const hasLocalScreen = streams.some(s => s.isLocal && s.type !== 'Câmera');
-    if (hasLocalScreen) {
-      setWindowsDiscordMute(muteDiscordOnShare);
-    } else if (!muteDiscordOnShare && discordCurrentlyMuted) {
-      setWindowsDiscordMute(false);
-    }
-  }, [muteDiscordOnShare]);
+    excludeDiscordRef.current = excludeDiscordAudio;
+    localStorage.setItem('tv_exclude_discord', String(excludeDiscordAudio));
+  }, [excludeDiscordAudio]);
 
   useEffect(() => {
     qualityRef.current = quality;
@@ -242,12 +218,11 @@ export default function App() {
 
     return () => {
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
-      setWindowsDiscordMute(false);
       socket.disconnect();
     };
   }, [inRoom, roomName, nickname]);
 
-  const startWebCodecsSender = async (streamId, mediaStream) => {
+  const startWebCodecsSender = async (streamId, mediaStream, isCamera = false) => {
     const vTrack = mediaStream.getVideoTracks()[0];
     if (!vTrack) return;
 
@@ -257,6 +232,7 @@ export default function App() {
     let currentCodecStr = 'vp8';
     let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
+    const abortCtrl = new AbortController();
 
     const videoEncoder = new VideoEncoder({
       output: (chunk) => {
@@ -300,9 +276,11 @@ export default function App() {
     const settings = vTrack.getSettings ? vTrack.getSettings() : {};
     await configureEncoderNow(settings.width || 1920, settings.height || 1080);
 
+    // PIPELINE DE ÁUDIO:
+    // 1. Se estiver no App Desktop Windows, captura o áudio WASAPI com EXCLUSÃO DO DISCORD (você ouve o Discord normal, mas a live não ouve!)
+    // 2. Se estiver apenas no navegador comum, usa a trilha de áudio padrão do navegador.
     let audioEncoder = null;
-    const aTrack = mediaStream.getAudioTracks()[0];
-    if (aTrack && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window) {
+    if (!isCamera && 'AudioEncoder' in window) {
       try {
         audioEncoder = new AudioEncoder({
           output: (chunk) => {
@@ -318,17 +296,83 @@ export default function App() {
           },
           error: () => {}
         });
-        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 96000 });
-        const aProc = new MediaStreamTrackProcessor({ track: aTrack });
-        const aReader = aProc.readable.getReader();
-        (async () => {
-          while (running) {
-            const { value: aData, done } = await aReader.read();
-            if (done || !aData) break;
-            if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
-            aData.close();
+        audioEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
+
+        let usingDesktopWasapi = false;
+        if (desktopBridgeActive) {
+          try {
+            const excludeFlag = excludeDiscordRef.current ? 1 : 0;
+            const response = await fetch(`http://127.0.0.1:19876/clean-audio?exclude=${excludeFlag}`, {
+              signal: abortCtrl.signal
+            });
+            if (response.ok && response.body) {
+              usingDesktopWasapi = true;
+              setDiscordIsolatedActive(excludeDiscordRef.current);
+              addLog(
+                excludeDiscordRef.current
+                  ? 'Áudio WASAPI Ativo: Transmitindo som do PC/Jogo SEM a voz do Discord (você continua ouvindo o Discord normalmente).'
+                  : 'Áudio WASAPI Ativo: Transmitindo todo o som do PC.'
+              );
+
+              // Desativa a trilha bruta do navegador para não misturar com o stream limpo do WASAPI
+              mediaStream.getAudioTracks().forEach(t => { t.enabled = false; t.stop(); });
+
+              const reader = response.body.getReader();
+              let leftover = new Uint8Array(0);
+              const frameBytes = 960 * 4; // 20ms @ 48kHz stereo 16-bit PCM = 3840 bytes
+              let timestampUs = 0;
+
+              (async () => {
+                while (running) {
+                  const { value, done } = await reader.read();
+                  if (done || !value) break;
+
+                  const combined = new Uint8Array(leftover.length + value.length);
+                  combined.set(leftover, 0);
+                  combined.set(value, leftover.length);
+
+                  let offset = 0;
+                  while (offset + frameBytes <= combined.length) {
+                    const slice = combined.subarray(offset, offset + frameBytes);
+                    offset += frameBytes;
+
+                    if (audioEncoder.state === 'configured') {
+                      const ad = new AudioData({
+                        format: 's16',
+                        sampleRate: 48000,
+                        numberOfFrames: 960,
+                        numberOfChannels: 2,
+                        timestamp: timestampUs,
+                        data: slice
+                      });
+                      audioEncoder.encode(ad);
+                      ad.close();
+                      timestampUs += 20000;
+                    }
+                  }
+                  leftover = combined.slice(offset);
+                }
+              })().catch(() => {});
+            }
+          } catch (e) {}
+        }
+
+        // Fallback caso a pessoa esteja transmitindo pelo navegador sem o App Desktop instalado
+        if (!usingDesktopWasapi) {
+          const aTrack = mediaStream.getAudioTracks()[0];
+          if (aTrack && 'MediaStreamTrackProcessor' in window) {
+            const aProc = new MediaStreamTrackProcessor({ track: aTrack });
+            const aReader = aProc.readable.getReader();
+            (async () => {
+              while (running) {
+                const { value: aData, done } = await aReader.read();
+                if (done || !aData) break;
+                if (audioEncoder.state === 'configured') audioEncoder.encode(aData);
+                aData.close();
+              }
+            })().catch(() => {});
           }
-        })().catch(() => {});
+        }
       } catch (e) {}
     }
 
@@ -376,6 +420,8 @@ export default function App() {
       },
       stop: () => {
         running = false;
+        abortCtrl.abort();
+        setDiscordIsolatedActive(false);
         try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
         try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch (e) {}
       }
@@ -400,11 +446,6 @@ export default function App() {
           autoGainControl: false
         }
       });
-
-      // Se a opção "Mutar Discord ao compartilhar" estiver ativa (padrão), silencia o Discord.exe no Windows imediatamente
-      if (muteDiscordOnShare) {
-        setWindowsDiscordMute(true);
-      }
 
       const vTrack = mediaStream.getVideoTracks()[0];
       if (vTrack && 'contentHint' in vTrack) {
@@ -435,7 +476,7 @@ export default function App() {
         fps: targetFps
       });
 
-      await startWebCodecsSender(newId, mediaStream);
+      await startWebCodecsSender(newId, mediaStream, false);
     } catch (err) {
       addLog(`Compartilhamento cancelado: ${err.message}`);
     }
@@ -472,7 +513,7 @@ export default function App() {
         fps: Number(fps)
       });
 
-      await startWebCodecsSender(newId, mediaStream);
+      await startWebCodecsSender(newId, mediaStream, true);
     } catch (err) {
       alert('Não foi possível acessar a webcam.');
     }
@@ -485,14 +526,7 @@ export default function App() {
     setStreams(prev => {
       const target = prev.find(s => s.id === streamId);
       if (target?.stream) target.stream.getTracks().forEach(t => t.stop());
-      const remaining = prev.filter(s => s.id !== streamId);
-
-      // Se parou de compartilhar a tela, restaura o som do Discord automaticamente
-      const stillSharingScreen = remaining.some(s => s.isLocal && s.type !== 'Câmera');
-      if (!stillSharingScreen) {
-        setWindowsDiscordMute(false);
-      }
-      return remaining;
+      return prev.filter(s => s.id !== streamId);
     });
 
     socketRef.current?.emit('stop-stream', { streamId });
@@ -608,9 +642,9 @@ export default function App() {
           <span className="bg-[#1B202B] border border-[#262C3A] text-[11px] text-gray-300 px-2 py-0.5 rounded-full">
             {participants.length} online
           </span>
-          {discordCurrentlyMuted && (
-            <span className="bg-indigo-950/70 border border-indigo-700/60 text-[11px] text-indigo-300 px-2 py-0.5 rounded-full">
-              🔇 Discord Mutado
+          {discordIsolatedActive && (
+            <span className="bg-emerald-950/70 border border-emerald-700/60 text-[11px] text-emerald-300 px-2 py-0.5 rounded-full" title="Você escuta o Discord normalmente, mas a voz do Discord não sai na live">
+              🛡️ Voz do Discord Isolada da Live
             </span>
           )}
         </div>
@@ -660,19 +694,19 @@ export default function App() {
                   <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-white text-sm px-1.5 py-0.5 rounded bg-[#1C212C]">✕</button>
                 </div>
 
-                {/* Opção ativada por padrão para mutar o Discord ao compartilhar tela */}
+                {/* Opção ativada por padrão: Remove apenas da transmissão (não muta seu fone!) */}
                 <div className="bg-[#1B202B] border border-[#2B3242] rounded-lg p-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-white">Mutar Discord ao compartilhar</span>
+                    <span className="text-xs font-semibold text-white">Remover sons do Discord na live</span>
                     <input
                       type="checkbox"
-                      checked={muteDiscordOnShare}
-                      onChange={e => setMuteDiscordOnShare(e.target.checked)}
+                      checked={excludeDiscordAudio}
+                      onChange={e => setExcludeDiscordAudio(e.target.checked)}
                       className="w-4 h-4 accent-indigo-500 cursor-pointer"
                     />
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                    Vem ativado por padrão no App Windows: silencia o aplicativo Discord por completo enquanto você compartilha a tela para evitar duplicação de vozes.
+                    Ativado por padrão no App Windows: você continua ouvindo seus amigos no Discord normalmente, mas a voz deles não sai na sua transmissão (evita eco para quem assiste na web ou no app).
                   </p>
                 </div>
 
@@ -818,7 +852,6 @@ export default function App() {
         </aside>
       </div>
 
-      {/* MODAL DE DOWNLOAD DO EXECUTÁVEL WINDOWS */}
       {showDownloadModal && (
         <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
           <div className="bg-[#141820] border border-[#262C3A] rounded-xl w-full max-w-md p-5 space-y-4 shadow-2xl">
@@ -831,10 +864,10 @@ export default function App() {
                 O download de <b className="text-white">Telinha-Vogels-Windows.zip</b> foi iniciado!
               </p>
               <div className="bg-[#0D1016] border border-[#1E232E] rounded-lg p-3 space-y-1.5 text-[11px]">
-                <p className="text-indigo-300 font-semibold">Como abrir sem alerta do Windows:</p>
+                <p className="text-indigo-300 font-semibold">Como instalar a captura seletiva (Sem Eco do Discord):</p>
                 <p>1. Extraia o arquivo <b>Telinha-Vogels-Windows.zip</b>.</p>
                 <p>2. Dê dois cliques em <b>Instalar e Abrir Telinha Vogels.cmd</b>.</p>
-                <p>3. Ele criará o executável nativo <b>TelinhaVogels.exe</b> e o atalho na sua Área de Trabalho com a função de <b>Mutar o Discord automaticamente</b> ao compartilhar a tela.</p>
+                <p>3. Ele compila o motor nativo <b>WASAPI Process Loopback Exclusion</b>: você escuta seus amigos no Discord normalmente, mas a voz deles é filtrada da sua live para quem assiste na web ou no app.</p>
               </div>
             </div>
             <div className="flex justify-end gap-2 pt-1">
@@ -904,8 +937,12 @@ function VideoTile({
 }) {
   const localVideoRef = useRef(null);
   const remoteCanvasRef = useRef(null);
-  const remoteAudioRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, mbps: '0.0' });
+  const mutedRef = useRef(streamObj.muted);
+
+  useEffect(() => {
+    mutedRef.current = streamObj.muted;
+  }, [streamObj.muted]);
 
   useEffect(() => {
     if (!streamObj.isLocal || !localVideoRef.current || !streamObj.stream) return;
@@ -1006,20 +1043,56 @@ function VideoTile({
       }
     };
 
+    // Reprodutor de Áudio Web Audio API (Funciona em qualquer navegador web para quem assiste!)
+    let audioCtx = null;
     let audioDecoder = null;
-    if ('AudioDecoder' in window && 'MediaStreamTrackGenerator' in window) {
+    let nextPlayTime = 0;
+
+    if ('AudioDecoder' in window) {
       try {
-        const trackGen = new MediaStreamTrackGenerator({ kind: 'audio' });
-        const writer = trackGen.writable.getWriter();
-        const remoteAudioStream = new MediaStream([trackGen]);
-        if (remoteAudioRef.current) {
-          remoteAudioRef.current.srcObject = remoteAudioStream;
-          remoteAudioRef.current.play().catch(() => {});
-        }
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
         audioDecoder = new AudioDecoder({
           output: (audioData) => {
-            writer.write(audioData).catch(() => {});
-            audioData.close();
+            try {
+              if (!mutedRef.current && audioCtx) {
+                if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+                const numFrames = audioData.numberOfFrames;
+                const numCh = audioData.numberOfChannels || 2;
+                const audioBuffer = audioCtx.createBuffer(numCh, numFrames, audioData.sampleRate || 48000);
+
+                // Extrai os canais decodificados para o Web Audio API
+                const fmt = audioData.format || 'f32-planar';
+                if (fmt.includes('planar')) {
+                  for (let c = 0; c < numCh; c++) {
+                    const chData = new Float32Array(numFrames);
+                    audioData.copyTo(chData, { planeIndex: c, format: 'f32-planar' });
+                    audioBuffer.copyToChannel(chData, c);
+                  }
+                } else {
+                  const interleaved = new Float32Array(numFrames * numCh);
+                  audioData.copyTo(interleaved, { planeIndex: 0 });
+                  for (let c = 0; c < numCh; c++) {
+                    const chData = audioBuffer.getChannelData(c);
+                    for (let i = 0; i < numFrames; i++) {
+                      chData[i] = interleaved[i * numCh + c];
+                    }
+                  }
+                }
+
+                const source = audioCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioCtx.destination);
+                const now = audioCtx.currentTime;
+                if (nextPlayTime < now || nextPlayTime - now > 0.25) {
+                  nextPlayTime = now + 0.02;
+                }
+                source.start(nextPlayTime);
+                nextPlayTime += audioBuffer.duration;
+              }
+            } catch (e) {
+            } finally {
+              audioData.close();
+            }
           },
           error: () => {}
         });
@@ -1075,14 +1148,9 @@ function VideoTile({
       delete audioChunkHandlersRef.current[streamObj.id];
       try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (e) {}
       try { if (audioDecoder && audioDecoder.state !== 'closed') audioDecoder.close(); } catch (e) {}
+      try { if (audioCtx && audioCtx.state !== 'closed') audioCtx.close(); } catch (e) {}
     };
   }, [streamObj.id, streamObj.isLocal]);
-
-  useEffect(() => {
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.muted = streamObj.muted;
-    }
-  }, [streamObj.muted]);
 
   return (
     <div className="relative bg-[#12151C] border border-[#222836] rounded-xl overflow-hidden flex items-center justify-center group">
@@ -1095,13 +1163,10 @@ function VideoTile({
           className="w-full h-full object-contain bg-black"
         />
       ) : (
-        <>
-          <canvas
-            ref={remoteCanvasRef}
-            className="w-full h-full object-contain bg-black"
-          />
-          <audio ref={remoteAudioRef} autoPlay muted={streamObj.muted} />
-        </>
+        <canvas
+          ref={remoteCanvasRef}
+          className="w-full h-full object-contain bg-black"
+        />
       )}
 
       <div className="absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-xs">

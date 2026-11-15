@@ -12,7 +12,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Gerador ZIP nativo em memória (sem dependências externas) para entrega limpa pelo navegador
 function createZipBuffer(files) {
   const crcTable = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -38,8 +37,8 @@ function createZipBuffer(files) {
     const localHeader = Buffer.alloc(30 + nameBuf.length);
     localHeader.writeUInt32LE(0x04034b50, 0);
     localHeader.writeUInt16LE(20, 4);
-    localHeader.writeUInt16LE(0x0800, 6); // UTF-8 flag
-    localHeader.writeUInt16LE(0, 8);      // STORE (0)
+    localHeader.writeUInt16LE(0x0800, 6);
+    localHeader.writeUInt16LE(0, 8);
     localHeader.writeUInt16LE(0, 10);
     localHeader.writeUInt16LE(0, 12);
     localHeader.writeUInt32LE(crc, 14);
@@ -88,12 +87,12 @@ function createZipBuffer(files) {
   return Buffer.concat([...localParts, ...centralParts, eocd]);
 }
 
-// Endpoint que gera e baixa o Executável Desktop Windows (TelinhaVogels.exe com WASAPI Anti-Eco do Discord)
 app.get('/api/download-app', (req, res) => {
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
   const appUrl = `${proto}://${req.get('host')}`;
 
-  // Código-fonte C# compilado nativamente pelo csc.exe do próprio Windows (Zero alerta de vírus/SmartScreen)
+  // Código C# Nativo com WASAPI PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+  // Captura todo o áudio do PC/Jogo EXCLUINDO o Discord.exe da transmissão (sem mutar o Discord para quem está jogando!)
   const csharpSource = `
 using System;
 using System.Diagnostics;
@@ -162,15 +161,114 @@ namespace TelinhaVogelsDesktop {
         int GetMute([MarshalAs(UnmanagedType.Bool)] out bool pbMute);
     }
 
-    public class Program {
-        static bool discordMuted = false;
+    // Interfaces WASAPI Process Loopback (Windows 10 20H1+ / Windows 11)
+    [ComImport, Guid("94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAgileObject { }
 
-        public static int SetDiscordMute(bool mute) {
-            int count = 0;
+    [ComImport, Guid("72A22D78-CDE4-431D-B8CC-843A71199B6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IActivateAudioInterfaceAsyncOperation {
+        void GetActivateResult([MarshalAs(UnmanagedType.Error)] out int activateResult, [MarshalAs(UnmanagedType.IUnknown)] out object activatedInterface);
+    }
+
+    [ComImport, Guid("41D949AB-9862-444A-80F6-C261334DA5EB"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IActivateAudioInterfaceCompletionHandler {
+        void ActivateCompleted(IActivateAudioInterfaceAsyncOperation activateOperation);
+    }
+
+    [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioClient {
+        int Initialize(int ShareMode, uint StreamFlags, long hnsBufferDuration, long hnsPeriodicity, ref WAVEFORMATEX pFormat, IntPtr AudioSessionGuid);
+        int GetBufferSize(out uint pNumBufferFrames);
+        int GetStreamLatency(out long phnsLatency);
+        int GetCurrentPadding(out uint pNumPaddingFrames);
+        int IsFormatSupported(int ShareMode, ref WAVEFORMATEX pFormat, IntPtr ppClosestMatch);
+        int GetMixFormat(out IntPtr ppDeviceFormat);
+        int GetDevicePeriod(out long phnsDefaultDevicePeriod, out long phnsMinimumDevicePeriod);
+        int Start();
+        int Stop();
+        int Reset();
+        int SetEventHandle(IntPtr eventHandle);
+        int GetService([MarshalAs(UnmanagedType.LPStruct)] Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+    }
+
+    [ComImport, Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioCaptureClient {
+        int GetBuffer(out IntPtr ppData, out uint pNumFramesToRead, out uint pdwFlags, out ulong pu64DevicePosition, out ulong pu64QPCPosition);
+        int ReleaseBuffer(uint NumFramesRead);
+        int GetNextPacketSize(out uint pNumFramesInNextPacket);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct WAVEFORMATEX {
+        public ushort wFormatTag;
+        public ushort nChannels;
+        public uint nSamplesPerSec;
+        public uint nAvgBytesPerSec;
+        public ushort nBlockAlign;
+        public ushort wBitsPerSample;
+        public ushort cbSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+        public uint TargetProcessId;
+        public int ProcessLoopbackMode; // 0 = INCLUDE_TREE, 1 = EXCLUDE_TREE
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct AUDIOCLIENT_ACTIVATION_PARAMS {
+        public int ActivationType; // 1 = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+        public AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct BLOB {
+        public uint cbSize;
+        public IntPtr pBlobData;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PROPVARIANT {
+        public ushort vt;
+        public ushort wReserved1;
+        public ushort wReserved2;
+        public ushort wReserved3;
+        public BLOB blob;
+        public IntPtr pReserved;
+    }
+
+    internal class ActivateCompletionHandler : IActivateAudioInterfaceCompletionHandler, IAgileObject {
+        public ManualResetEvent WaitEvent = new ManualResetEvent(false);
+        public IAudioClient AudioClient = null;
+
+        public void ActivateCompleted(IActivateAudioInterfaceAsyncOperation activateOperation) {
+            try {
+                int hr = 0;
+                object unk = null;
+                activateOperation.GetActivateResult(out hr, out unk);
+                if (hr >= 0 && unk != null) {
+                    AudioClient = unk as IAudioClient;
+                }
+            } catch { }
+            WaitEvent.Set();
+        }
+    }
+
+    public class Program {
+        [DllImport("Mmdevapi.dll", ExactSpelling = true, PreserveSig = false)]
+        static extern void ActivateAudioInterfaceAsync(
+            [MarshalAs(UnmanagedType.LPWStr)] string deviceInterfacePath,
+            [MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+            ref PROPVARIANT activationParams,
+            IActivateAudioInterfaceCompletionHandler completionHandler,
+            out IActivateAudioInterfaceAsyncOperation activationOperation);
+
+        // Garante que o Discord NUNCA fique mutado no fone de quem está streamando
+        public static void EnsureDiscordUnmutedForStreamer() {
             try {
                 IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
                 IMMDeviceCollection devices;
-                enumerator.EnumAudioEndpoints(0, 1, out devices); // eRender, DEVICE_STATE_ACTIVE
+                enumerator.EnumAudioEndpoints(0, 1, out devices);
                 int devCount = 0;
                 devices.GetCount(out devCount);
                 Guid iidMgr = typeof(IAudioSessionManager2).GUID;
@@ -194,34 +292,135 @@ namespace TelinhaVogelsDesktop {
                         sessionEnum.GetSession(i, out rawSession);
                         IAudioSessionControl2 ctl2 = rawSession as IAudioSessionControl2;
                         if (ctl2 == null) continue;
-
-                        uint pid = 0;
-                        ctl2.GetProcessId(out pid);
                         string sid = "";
                         ctl2.GetSessionIdentifier(out sid);
-
-                        bool isDiscord = false;
                         if (!string.IsNullOrEmpty(sid) && sid.ToLower().Contains("discord")) {
-                            isDiscord = true;
-                        } else if (pid > 0) {
-                            try {
-                                Process p = Process.GetProcessById((int)pid);
-                                if (p != null && p.ProcessName.ToLower().Contains("discord")) isDiscord = true;
-                            } catch { }
-                        }
-
-                        if (isDiscord) {
                             ISimpleAudioVolume vol = rawSession as ISimpleAudioVolume;
-                            if (vol != null) {
-                                vol.SetMute(mute, ref emptyGuid);
-                                count++;
-                            }
+                            if (vol != null) vol.SetMute(false, ref emptyGuid);
                         }
                     }
                 }
-                discordMuted = mute;
             } catch { }
-            return count;
+        }
+
+        // Localiza o PID do processo do Discord para excluí-lo da captura da live (sem mutar no fone!)
+        public static uint FindDiscordTargetPid() {
+            try {
+                // 1. Procura a árvore raiz do Discord.exe (o processo pai iniciado primeiro engloba todos os subprocessos de áudio)
+                Process[] procs = Process.GetProcessesByName("Discord");
+                if (procs != null && procs.Length > 0) {
+                    Process rootProc = procs[0];
+                    DateTime earliest = DateTime.MaxValue;
+                    foreach (Process p in procs) {
+                        try {
+                            if (p.StartTime < earliest) {
+                                earliest = p.StartTime;
+                                rootProc = p;
+                            }
+                        } catch { }
+                    }
+                    return (uint)rootProc.Id;
+                }
+            } catch { }
+            return (uint)Process.GetCurrentProcess().Id;
+        }
+
+        public static IAudioClient CreateProcessExcludedAudioClient(uint excludePid) {
+            AUDIOCLIENT_ACTIVATION_PARAMS actParams = new AUDIOCLIENT_ACTIVATION_PARAMS();
+            actParams.ActivationType = 1; // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+            actParams.ProcessLoopbackParams.TargetProcessId = excludePid;
+            actParams.ProcessLoopbackParams.ProcessLoopbackMode = 1; // PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+
+            int size = Marshal.SizeOf(actParams);
+            IntPtr ptr = Marshal.AllocHGlobal(size);
+            Marshal.StructureToPtr(actParams, ptr, false);
+
+            try {
+                PROPVARIANT pv = new PROPVARIANT();
+                pv.vt = 65; // VT_BLOB
+                pv.blob.cbSize = (uint)size;
+                pv.blob.pBlobData = ptr;
+
+                ActivateCompletionHandler handler = new ActivateCompletionHandler();
+                IActivateAudioInterfaceAsyncOperation op = null;
+                ActivateAudioInterfaceAsync("VAD\\\\Process_Loopback", typeof(IAudioClient).GUID, ref pv, handler, out op);
+                handler.WaitEvent.WaitOne(3000);
+                return handler.AudioClient;
+            } catch {
+                return null;
+            } finally {
+                Marshal.FreeHGlobal(ptr);
+            }
+        }
+
+        static void StreamCleanAudioWithoutDiscord(NetworkStream netStream, bool excludeDiscord) {
+            string headers = "HTTP/1.1 200 OK\\r\\n" +
+                             "Content-Type: application/octet-stream\\r\\n" +
+                             "Access-Control-Allow-Origin: *\\r\\n" +
+                             "Access-Control-Allow-Private-Network: true\\r\\n" +
+                             "Cache-Control: no-cache\\r\\n" +
+                             "Connection: close\\r\\n\\r\\n";
+            byte[] headBytes = Encoding.UTF8.GetBytes(headers);
+            netStream.Write(headBytes, 0, headBytes.Length);
+
+            uint targetPid = excludeDiscord ? FindDiscordTargetPid() : (uint)Process.GetCurrentProcess().Id;
+            IAudioClient client = CreateProcessExcludedAudioClient(targetPid);
+            if (client == null) return;
+
+            WAVEFORMATEX fmt = new WAVEFORMATEX();
+            fmt.wFormatTag = 1; // WAVE_FORMAT_PCM
+            fmt.nChannels = 2;
+            fmt.nSamplesPerSec = 48000;
+            fmt.wBitsPerSample = 16;
+            fmt.nBlockAlign = 4;
+            fmt.nAvgBytesPerSec = 192000;
+            fmt.cbSize = 0;
+
+            // AUDCLNT_STREAMFLAGS_LOOPBACK (0x00020000) | AUTOCONVERTPCM (0x80000000) | SRC_DEFAULT_QUALITY (0x08000000)
+            int hr = client.Initialize(0, 0x88020000, 200000, 0, ref fmt, IntPtr.Zero);
+            if (hr < 0) return;
+
+            object objCap = null;
+            client.GetService(typeof(IAudioCaptureClient).GUID, out objCap);
+            IAudioCaptureClient capture = objCap as IAudioCaptureClient;
+            if (capture == null) return;
+
+            client.Start();
+            try {
+                byte[] silenceBuf = new byte[48000];
+                while (true) {
+                    uint packetSize = 0;
+                    capture.GetNextPacketSize(out packetSize);
+                    while (packetSize > 0) {
+                        IntPtr dataPtr;
+                        uint numFrames;
+                        uint flags;
+                        ulong devPos;
+                        ulong qpcPos;
+                        int res = capture.GetBuffer(out dataPtr, out numFrames, out flags, out devPos, out qpcPos);
+                        if (res < 0) break;
+
+                        int byteCount = (int)(numFrames * 4);
+                        if (byteCount > 0) {
+                            if ((flags & 2) != 0) {
+                                if (byteCount <= silenceBuf.Length) {
+                                    netStream.Write(silenceBuf, 0, byteCount);
+                                }
+                            } else {
+                                byte[] pcm = new byte[byteCount];
+                                Marshal.Copy(dataPtr, pcm, 0, byteCount);
+                                netStream.Write(pcm, 0, byteCount);
+                            }
+                        }
+                        capture.ReleaseBuffer(numFrames);
+                        capture.GetNextPacketSize(out packetSize);
+                    }
+                    Thread.Sleep(10);
+                }
+            } catch {
+            } finally {
+                try { client.Stop(); } catch { }
+            }
         }
 
         static void StartLocalBridge() {
@@ -230,33 +429,44 @@ namespace TelinhaVogelsDesktop {
                     TcpListener server = new TcpListener(IPAddress.Loopback, 19876);
                     server.Start();
                     while (true) {
-                        using (TcpClient client = server.AcceptTcpClient())
-                        using (NetworkStream stream = client.GetStream()) {
-                            byte[] buf = new byte[1024];
-                            int read = stream.Read(buf, 0, buf.Length);
-                            string req = Encoding.UTF8.GetString(buf, 0, read);
+                        TcpClient client = server.AcceptTcpClient();
+                        ThreadPool.QueueUserWorkItem((obj) => {
+                            TcpClient c = (TcpClient)obj;
+                            try {
+                                using (c)
+                                using (NetworkStream stream = c.GetStream()) {
+                                    byte[] buf = new byte[1024];
+                                    int read = stream.Read(buf, 0, buf.Length);
+                                    string req = Encoding.UTF8.GetString(buf, 0, read);
 
-                            int affected = 0;
-                            if (req.Contains("/discord-mute?mute=1")) {
-                                affected = SetDiscordMute(true);
-                            } else if (req.Contains("/discord-mute?mute=0")) {
-                                affected = SetDiscordMute(false);
-                            }
+                                    if (req.StartsWith("OPTIONS")) {
+                                        string opt = "HTTP/1.1 204 No Content\\r\\nAccess-Control-Allow-Origin: *\\r\\nAccess-Control-Allow-Methods: GET, OPTIONS\\r\\nAccess-Control-Allow-Headers: *\\r\\nAccess-Control-Allow-Private-Network: true\\r\\nConnection: close\\r\\n\\r\\n";
+                                        byte[] ob = Encoding.UTF8.GetBytes(opt);
+                                        stream.Write(ob, 0, ob.Length);
+                                        return;
+                                    }
 
-                            string json = "{\\"ok\\":true,\\"desktop\\":true,\\"discordMuted\\":" + (discordMuted ? "true" : "false") + ",\\"sessions\\":" + affected + "}";
-                            byte[] body = Encoding.UTF8.GetBytes(json);
-                            string headers = "HTTP/1.1 200 OK\\r\\n" +
-                                             "Content-Type: application/json\\r\\n" +
-                                             "Access-Control-Allow-Origin: *\\r\\n" +
-                                             "Access-Control-Allow-Methods: GET, POST, OPTIONS\\r\\n" +
-                                             "Access-Control-Allow-Headers: *\\r\\n" +
-                                             "Access-Control-Allow-Private-Network: true\\r\\n" +
-                                             "Content-Length: " + body.Length + "\\r\\n" +
-                                             "Connection: close\\r\\n\\r\\n";
-                            byte[] headBytes = Encoding.UTF8.GetBytes(headers);
-                            stream.Write(headBytes, 0, headBytes.Length);
-                            stream.Write(body, 0, body.Length);
-                        }
+                                    if (req.Contains("/clean-audio")) {
+                                        bool exclude = !req.Contains("exclude=0");
+                                        StreamCleanAudioWithoutDiscord(stream, exclude);
+                                        return;
+                                    }
+
+                                    uint dPid = FindDiscordTargetPid();
+                                    string json = "{\\"ok\\":true,\\"desktop\\":true,\\"discordPid\\":" + dPid + "}";
+                                    byte[] body = Encoding.UTF8.GetBytes(json);
+                                    string headers = "HTTP/1.1 200 OK\\r\\n" +
+                                                     "Content-Type: application/json\\r\\n" +
+                                                     "Access-Control-Allow-Origin: *\\r\\n" +
+                                                     "Access-Control-Allow-Private-Network: true\\r\\n" +
+                                                     "Content-Length: " + body.Length + "\\r\\n" +
+                                                     "Connection: close\\r\\n\\r\\n";
+                                    byte[] headBytes = Encoding.UTF8.GetBytes(headers);
+                                    stream.Write(headBytes, 0, headBytes.Length);
+                                    stream.Write(body, 0, body.Length);
+                                }
+                            } catch { }
+                        }, client);
                     }
                 } catch { }
             });
@@ -266,6 +476,8 @@ namespace TelinhaVogelsDesktop {
 
         [STAThread]
         public static void Main(string[] args) {
+            // Garante que o Discord esteja desmutado no mixer do Windows para você ouvir seus amigos normalmente
+            EnsureDiscordUnmutedForStreamer();
             StartLocalBridge();
 
             string url = "${appUrl}/?desktop=1";
@@ -284,30 +496,22 @@ namespace TelinhaVogelsDesktop {
                 if (File.Exists(b)) { chosenBrowser = b; break; }
             }
 
-            try {
-                if (chosenBrowser != null) {
-                    ProcessStartInfo psi = new ProcessStartInfo();
-                    psi.FileName = chosenBrowser;
-                    psi.Arguments = "--app=\\"" + url + "\\" --user-data-dir=\\"" + profileDir + "\\" --disable-features=BlockInsecurePrivateNetworkRequests --autoplay-policy=no-user-gesture-required";
-                    psi.UseShellExecute = false;
-                    Process appProc = Process.Start(psi);
-                    if (appProc != null) {
-                        appProc.WaitForExit();
-                    }
-                } else {
-                    Process.Start(url);
-                    Thread.Sleep(3600000);
-                }
-            } finally {
-                // Garante que o Discord seja desmutado ao fechar o Telinha Vogels
-                SetDiscordMute(false);
+            if (chosenBrowser != null) {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = chosenBrowser;
+                psi.Arguments = "--app=\\"" + url + "\\" --user-data-dir=\\"" + profileDir + "\\" --enable-features=ApplicationAudioCaptureWin --disable-features=BlockInsecurePrivateNetworkRequests --autoplay-policy=no-user-gesture-required";
+                psi.UseShellExecute = false;
+                Process appProc = Process.Start(psi);
+                if (appProc != null) appProc.WaitForExit();
+            } else {
+                Process.Start(url);
+                Thread.Sleep(3600000);
             }
         }
     }
 }
 `.trim();
 
-  // Script instalador (.cmd) que compila o TelinhaVogels.exe localmente usando o compilador nativo da Microsoft (Zero SmartScreen!)
   const installerCmd = `@echo off
 chcp 65001 >nul
 title Instalador Telinha Vogels Desktop
@@ -315,7 +519,8 @@ echo ========================================================
 echo   TELINHA VOGELS - INSTALADOR DESKTOP OFICIAL (WINDOWS)
 echo ========================================================
 echo.
-echo [1/3] Preparando ambiente nativo WASAPI (Anti-Eco Discord)...
+echo [1/3] Encerrando instancias antigas e preparando captura WASAPI...
+taskkill /F /IM TelinhaVogels.exe >nul 2>&1
 
 set "APP_DIR=%LOCALAPPDATA%\\TelinhaVogels"
 if not exist "%APP_DIR%" mkdir "%APP_DIR%"
@@ -325,7 +530,7 @@ copy /Y "%~dp0TelinhaVogels.cs" "%APP_DIR%\\TelinhaVogels.cs" >nul
 set "CSC=%WINDIR%\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"
 
-echo [2/3] Gerando executavel assinado localmente (Sem alerta SmartScreen)...
+echo [2/3] Compilando executavel nativo (Sem alerta SmartScreen)...
 "%CSC%" /target:winexe /nologo /optimize+ /out:"%APP_DIR%\\TelinhaVogels.exe" "%APP_DIR%\\TelinhaVogels.cs"
 
 echo [3/3] Criando atalho 'Telinha Vogels' na Area de Trabalho...
