@@ -60,27 +60,39 @@ function unpackBinaryFrame(arrayBuffer) {
   return { headerObj, payloadBuffer };
 }
 
-async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec) {
-  const w = Math.max(2, Math.floor(width / 2) * 2);
-  const h = Math.max(2, Math.floor(height / 2) * 2);
+// Alinha dimensões em múltiplos de 16 (evita crash em placas AMD/NVIDIA/Intel) e tem fallback garantido para VP8 Software!
+async function findSupportedVideoConfig(width, height, fps, bitrate, preferredCodec, forceSoftware = false) {
+  const w = Math.max(64, Math.floor(width / 16) * 16);
+  const h = Math.max(64, Math.floor(height / 16) * 16);
+
+  if (forceSoftware) {
+    return {
+      codec: 'vp8',
+      width: w,
+      height: h,
+      bitrate,
+      framerate: fps,
+      latencyMode: 'realtime',
+      hardwareAcceleration: 'prefer-software'
+    };
+  }
 
   const candidates = [
-    preferredCodec === 'H264' ? { codec: 'avc1.64002a', avc: { format: 'annexb' } } : null,
+    preferredCodec === 'VP8' ? { codec: 'vp8' } : null,
+    preferredCodec === 'H264' ? { codec: 'avc1.42e01f', avc: { format: 'annexb' } } : null,
     preferredCodec === 'H264' ? { codec: 'avc1.4d002a', avc: { format: 'annexb' } } : null,
     preferredCodec === 'VP9' ? { codec: 'vp09.00.10.08' } : null,
-    { codec: 'vp8' },
-    { codec: 'avc1.42e01f', avc: { format: 'annexb' } }
+    { codec: 'vp8' }
   ].filter(Boolean);
 
-  for (const hw of ['prefer-hardware', 'no-preference']) {
-    for (const cand of candidates) {
+  for (const cand of candidates) {
+    for (const hw of ['no-preference', 'prefer-hardware', 'prefer-software']) {
       try {
         const cfg = {
           ...cand,
           width: w,
           height: h,
           bitrate,
-          bitrateMode: 'variable',
           framerate: fps,
           latencyMode: 'realtime',
           hardwareAcceleration: hw
@@ -137,13 +149,10 @@ function createZeroCpuChunkBuffer() {
 
 export default function App() {
   const [inRoom, setInRoom] = useState(false);
-
-  // Item 3: Sem valores padrão fixos ("gosadinhas" e "squad-brasil" removidos); iniciam vazios com os placeholders solicitados
   const [nickname, setNickname] = useState('');
   const [roomName, setRoomName] = useState('');
   const [roomPassword, setRoomPassword] = useState('');
 
-  // Item 4: Histórico de até 3 últimas salas salvas no navegador
   const [recentRooms, setRecentRooms] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem('tv_recent_rooms') || '[]');
@@ -177,7 +186,8 @@ export default function App() {
     return saved !== null ? saved === 'true' : true;
   });
 
-  const [codec, setCodec] = useState('H264');
+  // VP8 como padrão: 100% compatível entre todas as placas de vídeo (NVIDIA, AMD e Intel) sem dar tela preta!
+  const [codec, setCodec] = useState('VP8');
 
   const persistentClientIdRef = useRef('u_' + Math.random().toString(36).substring(2, 10));
   const [myId, setMyId] = useState(persistentClientIdRef.current);
@@ -194,7 +204,6 @@ export default function App() {
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef(null);
 
-  // Detecta se o dispositivo suporta compartilhamento de tela (PC vs Celular)
   const canShareScreen = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getDisplayMedia);
 
   const transportRef = useRef({
@@ -248,7 +257,6 @@ export default function App() {
     if (params.get('senha')) setRoomPassword(params.get('senha'));
   }, []);
 
-  // Salva a sala nas últimas 3 salas visitadas
   const saveRoomToHistory = (cRoom, cPass, usedNick) => {
     try {
       const entry = {
@@ -265,7 +273,6 @@ export default function App() {
     } catch (e) {}
   };
 
-  // Item 4: Ao clicar em uma das últimas 3 salas, entra automaticamente!
   const handleQuickJoinRecentRoom = (item) => {
     const chosenNick = nickname.trim() || item.nick || localStorage.getItem('tv_last_nick') || 'Visitante';
     setNickname(chosenNick);
@@ -283,54 +290,50 @@ export default function App() {
     setParticipants([{ id: cid, nick: nickname }]);
 
     let isUnmounted = false;
-    let controlWs = null;
-    let mediaWs = null;
+    let ws = null;
     let fallbackSocket = null;
     let heartbeatTimer = null;
-    let controlReconnectTimer = null;
-    let mediaReconnectTimer = null;
+    let reconnectTimer = null;
 
     const onRoomUsers = (list) => {
       if (isUnmounted) return;
       setParticipants(list && list.length ? list : [{ id: cid, nick: nickname }]);
     };
 
+    // IMPORTANTE: Nunca apaga uma live que já está aberta na tela por oscilação momentânea da lista!
     const onActiveStreams = (list) => {
       if (isUnmounted || !Array.isArray(list)) return;
       setStreams(prev => {
-        const localOnes = prev.filter(s => s.isLocal);
-        const remoteOnes = prev.filter(s => !s.isLocal);
-        const updatedRemotes = [];
+        const nextList = [...prev];
 
         list.forEach(st => {
           if (!st || !st.streamId) return;
           if (
             st.senderId === myIdRef.current ||
             st.senderId === cid ||
-            localStreamIdsRef.current.has(st.streamId) ||
-            localOnes.some(l => l.id === st.streamId)
+            localStreamIdsRef.current.has(st.streamId)
           ) {
             return;
           }
 
-          const existing = remoteOnes.find(p => p.id === st.streamId);
-          if (existing) {
-            updatedRemotes.push({
-              ...existing,
+          const existingIdx = nextList.findIndex(p => p.id === st.streamId);
+          if (existingIdx !== -1) {
+            nextList[existingIdx] = {
+              ...nextList[existingIdx],
               senderId: st.senderId,
               owner: st.owner,
               res: st.res,
               fps: st.fps
-            });
+            };
           } else {
             const isStopped = stoppedWatchingSetRef.current.has(st.streamId);
-            updatedRemotes.push({
+            nextList.push({
               id: st.streamId,
               senderId: st.senderId,
               owner: st.owner,
-              type: st.type,
-              res: st.res,
-              fps: st.fps,
+              type: st.type || 'Tela',
+              res: st.res || '1080p',
+              fps: st.fps || 60,
               volume: 75,
               muted: false,
               minimized: false,
@@ -341,7 +344,7 @@ export default function App() {
           }
         });
 
-        return [...localOnes, ...updatedRemotes];
+        return nextList;
       });
     };
 
@@ -367,9 +370,9 @@ export default function App() {
             id: st.streamId,
             senderId: st.senderId,
             owner: st.owner,
-            type: st.type,
-            res: st.res,
-            fps: st.fps,
+            type: st.type || 'Tela',
+            res: st.res || '1080p',
+            fps: st.fps || 60,
             volume: 75,
             muted: false,
             minimized: false,
@@ -396,7 +399,7 @@ export default function App() {
             senderId: meta.senderId,
             owner: meta.owner || 'Participante',
             type: 'Tela',
-            res: `${meta.h}p`,
+            res: `${meta.h || 1080}p`,
             fps: meta.fps || 60,
             volume: 75,
             muted: false,
@@ -444,26 +447,27 @@ export default function App() {
       });
     };
 
+    // TÚNEL WEBSOCKET ÚNICO UNIFICADO (Se o participante está na sala, o vídeo e o chat passam 100% pelo mesmo socket!)
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const controlUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=control&cid=${encodeURIComponent(cid)}`;
-    const mediaUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&role=media&cid=${encodeURIComponent(cid)}`;
+    const wsUrl = `${wsProto}//${window.location.host}/ws?room=${encodeURIComponent(fullRoomKey)}&cid=${encodeURIComponent(cid)}`;
 
     let cfEverConnected = false;
 
-    const connectControlWs = () => {
+    const connectUnifiedWs = () => {
       if (isUnmounted || fallbackSocket) return;
       try {
-        if (controlWs) {
-          controlWs.onclose = null;
-          controlWs.onerror = null;
-          try { controlWs.close(); } catch (e) {}
+        if (ws) {
+          ws.onclose = null;
+          ws.onerror = null;
+          try { ws.close(); } catch (e) {}
         }
-        controlWs = new WebSocket(controlUrl);
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
 
-        controlWs.onopen = () => {
+        ws.onopen = () => {
           if (isUnmounted) return;
           cfEverConnected = true;
-          controlWs.send(JSON.stringify({
+          ws.send(JSON.stringify({
             type: 'join-room',
             clientId: cid,
             roomName: cleanRoom,
@@ -471,13 +475,24 @@ export default function App() {
             nickname
           }));
 
+          // Reanuncia todas as lives locais ativas e força envio de Keyframe imediato
           activeLocalMetasRef.current.forEach((meta) => {
-            controlWs.send(JSON.stringify({ type: 'start-stream', meta }));
+            ws.send(JSON.stringify({ type: 'start-stream', meta }));
           });
+          Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
         };
 
-        controlWs.onmessage = (event) => {
-          if (isUnmounted || event.data instanceof ArrayBuffer) return;
+        ws.onmessage = (event) => {
+          if (isUnmounted) return;
+          if (event.data instanceof ArrayBuffer) {
+            try {
+              const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
+              if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
+              else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
+            } catch (e) {}
+            return;
+          }
+
           try {
             const data = JSON.parse(event.data);
             if (data.type === 'pong') return;
@@ -500,17 +515,17 @@ export default function App() {
           } catch (e) {}
         };
 
-        controlWs.onclose = () => {
+        ws.onclose = () => {
           if (isUnmounted) return;
           if (!cfEverConnected && !fallbackSocket) {
             startSocketIoFallback();
           } else if (cfEverConnected) {
-            clearTimeout(controlReconnectTimer);
-            controlReconnectTimer = setTimeout(connectControlWs, 400);
+            clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connectUnifiedWs, 400);
           }
         };
 
-        controlWs.onerror = () => {
+        ws.onerror = () => {
           if (!cfEverConnected && !fallbackSocket && !isUnmounted) {
             startSocketIoFallback();
           }
@@ -520,71 +535,32 @@ export default function App() {
       }
     };
 
-    const connectMediaWs = () => {
-      if (isUnmounted || fallbackSocket) return;
-      try {
-        if (mediaWs) {
-          mediaWs.onclose = null;
-          mediaWs.onerror = null;
-          try { mediaWs.close(); } catch (e) {}
-        }
-        mediaWs = new WebSocket(mediaUrl);
-        mediaWs.binaryType = 'arraybuffer';
-
-        mediaWs.onopen = () => {
-          if (isUnmounted) return;
-          cfEverConnected = true;
-          Object.values(activeEncodersRef.current).forEach(enc => enc.forceKey?.());
-        };
-
-        mediaWs.onmessage = (event) => {
-          if (isUnmounted || !(event.data instanceof ArrayBuffer)) return;
-          try {
-            const { headerObj, payloadBuffer } = unpackBinaryFrame(event.data);
-            if (headerObj.k === 'v') onVChunk(headerObj, payloadBuffer);
-            else if (headerObj.k === 'a') onAChunk(headerObj, payloadBuffer);
-          } catch (e) {}
-        };
-
-        mediaWs.onclose = () => {
-          if (isUnmounted) return;
-          if (cfEverConnected) {
-            clearTimeout(mediaReconnectTimer);
-            mediaReconnectTimer = setTimeout(connectMediaWs, 400);
-          }
-        };
-      } catch (e) {}
-    };
-
     transportRef.current = {
       mode: 'cf-ws',
       sendControl: (type, payload = {}) => {
-        if (controlWs && controlWs.readyState === 1) {
-          controlWs.send(JSON.stringify({ type, ...payload }));
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type, ...payload }));
         }
       },
       sendVideoChunk: (meta, buffer) => {
-        if (mediaWs && mediaWs.readyState === 1) {
-          mediaWs.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
+        // Keyframes têm prioridade total; frames normais respeitam limite de 512KB para não derrubar o socket
+        if (ws && ws.readyState === 1 && (meta.t === 'key' || ws.bufferedAmount < 524288)) {
+          ws.send(packBinaryFrame({ k: 'v', ...meta }, buffer));
         }
       },
       sendAudioChunk: (meta, buffer) => {
-        if (mediaWs && mediaWs.readyState === 1 && mediaWs.bufferedAmount < 524288) {
-          mediaWs.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
+        if (ws && ws.readyState === 1 && ws.bufferedAmount < 524288) {
+          ws.send(packBinaryFrame({ k: 'a', ...meta }, buffer));
         }
       },
-      getBufferedAmount: () => (mediaWs ? mediaWs.bufferedAmount : 0)
+      getBufferedAmount: () => (ws ? ws.bufferedAmount : 0)
     };
 
-    connectControlWs();
-    connectMediaWs();
+    connectUnifiedWs();
 
     heartbeatTimer = setInterval(() => {
-      if (controlWs && controlWs.readyState === 1) {
-        try { controlWs.send('ping'); } catch (e) {}
-      }
-      if (mediaWs && mediaWs.readyState === 1) {
-        try { mediaWs.send('ping'); } catch (e) {}
+      if (ws && ws.readyState === 1) {
+        try { ws.send('ping'); } catch (e) {}
       }
     }, 15000);
 
@@ -642,12 +618,10 @@ export default function App() {
     return () => {
       isUnmounted = true;
       clearInterval(heartbeatTimer);
-      clearTimeout(controlReconnectTimer);
-      clearTimeout(mediaReconnectTimer);
+      clearTimeout(reconnectTimer);
       Object.values(activeEncodersRef.current).forEach(e => e.stop?.());
       Object.values(ramClipBuffersRef.current).forEach(b => b.clear?.());
-      try { if (controlWs) { controlWs.onclose = null; controlWs.close(); } } catch (e) {}
-      try { if (mediaWs) { mediaWs.onclose = null; mediaWs.close(); } } catch (e) {}
+      try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
       try { if (fallbackSocket) fallbackSocket.disconnect(); } catch (e) {}
     };
   }, [inRoom, roomName, roomPassword, nickname]);
@@ -711,6 +685,7 @@ export default function App() {
     }
   };
 
+  // Transmissor com Auto-Recuperação (Se o encoder de hardware da GPU falhar, recria em VP8 Software na mesma hora!)
   const startWebCodecsSender = async (streamId, mediaStream, isCamera = false) => {
     const vTrack = mediaStream.getVideoTracks()[0];
     if (!vTrack) return;
@@ -722,34 +697,51 @@ export default function App() {
     let currentCodecStr = 'vp8';
     let targetW = RES_CONFIG[qualityRef.current]?.width || 1920;
     let targetH = RES_CONFIG[qualityRef.current]?.height || 1080;
+    let videoEncoder = null;
+    let usingSoftwareFallback = false;
 
     ramClipBuffersRef.current[streamId] = createZeroCpuChunkBuffer();
 
-    const videoEncoder = new VideoEncoder({
-      output: (chunk) => {
-        if (!running) return;
-        const buf = new Uint8Array(chunk.byteLength);
-        chunk.copyTo(buf);
+    const createAndConfigureEncoder = async (forceSw = false) => {
+      try {
+        if (videoEncoder && videoEncoder.state !== 'closed') {
+          videoEncoder.close();
+        }
+      } catch (e) {}
 
-        const meta = {
-          id: streamId,
-          senderId: myIdRef.current,
-          owner: nickname,
-          c: currentCodecStr,
-          t: chunk.type,
-          ts: chunk.timestamp,
-          w: targetW,
-          h: targetH,
-          fps: fpsRef.current
-        };
+      videoEncoder = new VideoEncoder({
+        output: (chunk) => {
+          if (!running) return;
+          const buf = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buf);
 
-        ramClipBuffersRef.current[streamId]?.pushChunk(meta, buf.buffer);
-        transportRef.current.sendVideoChunk(meta, buf.buffer);
-      },
-      error: () => {}
-    });
+          const meta = {
+            id: streamId,
+            senderId: myIdRef.current,
+            owner: nickname,
+            c: currentCodecStr,
+            t: chunk.type,
+            ts: chunk.timestamp,
+            w: targetW,
+            h: targetH,
+            fps: fpsRef.current
+          };
 
-    const configureEncoderNow = async (rawW, rawH) => {
+          ramClipBuffersRef.current[streamId]?.pushChunk(meta, buf.buffer);
+          transportRef.current.sendVideoChunk(meta, buf.buffer);
+        },
+        error: () => {
+          // Se a placa de vídeo recusar codificar por hardware, muda automaticamente para VP8 Software sem cair a live!
+          if (running && !usingSoftwareFallback) {
+            usingSoftwareFallback = true;
+            createAndConfigureEncoder(true);
+          }
+        }
+      });
+
+      const settings = vTrack.getSettings ? vTrack.getSettings() : {};
+      const rawW = settings.width || 1920;
+      const rawH = settings.height || 1080;
       const cfg = RES_CONFIG[qualityRef.current] || RES_CONFIG['1080p'];
       const targetFps = Number(fpsRef.current) || 60;
       const targetBitrateBps = (Number(bitrateKbpsRef.current) || 4000) * 1000;
@@ -757,19 +749,30 @@ export default function App() {
       targetH = Math.min(cfg.height, rawH || cfg.height);
       targetW = Math.round(targetH * ratio);
 
-      const bestCfg = await findSupportedVideoConfig(targetW, targetH, targetFps, targetBitrateBps, codecRef.current);
+      const bestCfg = await findSupportedVideoConfig(
+        targetW,
+        targetH,
+        targetFps,
+        targetBitrateBps,
+        forceSw ? 'VP8' : codecRef.current,
+        forceSw
+      );
       currentCodecStr = bestCfg.codec;
       targetW = bestCfg.width;
       targetH = bestCfg.height;
 
-      if (videoEncoder.state !== 'closed') {
+      try {
         videoEncoder.configure(bestCfg);
         forceKey = true;
+      } catch (e) {
+        if (!forceSw) {
+          usingSoftwareFallback = true;
+          await createAndConfigureEncoder(true);
+        }
       }
     };
 
-    const settings = vTrack.getSettings ? vTrack.getSettings() : {};
-    await configureEncoderNow(settings.width || 1920, settings.height || 1080);
+    await createAndConfigureEncoder(false);
 
     let audioEncoder = null;
     const aTrack = mediaStream.getAudioTracks()[0];
@@ -807,6 +810,39 @@ export default function App() {
       } catch (e) {}
     }
 
+    // Leitor de quadros com fallback universal (funciona em todos os navegadores)
+    let fallbackInterval = null;
+    let hiddenVideo = null;
+
+    const encodeSingleFrame = (frame) => {
+      const now = performance.now();
+      const minInterval = 1000 / (Number(fpsRef.current) + 2);
+      const netBusy = transportRef.current.getBufferedAmount() > 393216;
+
+      if (!videoEncoder || videoEncoder.state !== 'configured' || videoEncoder.encodeQueueSize > 2 || netBusy) {
+        frame.close();
+        return;
+      }
+
+      try {
+        // Envia Keyframe a cada 90 frames (1.5s) para entrada instantânea de quem clica em Assistir!
+        const isKey = forceKey || (frameCount % 90 === 0);
+        if (isKey) {
+          forceKey = false;
+          lastKeyframeTs = now;
+        }
+        videoEncoder.encode(frame, { keyFrame: isKey });
+        frameCount++;
+      } catch (e) {
+        if (!usingSoftwareFallback) {
+          usingSoftwareFallback = true;
+          createAndConfigureEncoder(true);
+        }
+      } finally {
+        frame.close();
+      }
+    };
+
     if ('MediaStreamTrackProcessor' in window) {
       const processor = new MediaStreamTrackProcessor({ track: vTrack });
       const reader = processor.readable.getReader();
@@ -816,49 +852,48 @@ export default function App() {
         while (running) {
           const { value: frame, done } = await reader.read();
           if (done || !frame) break;
-
           const now = performance.now();
           const minInterval = 1000 / (Number(fpsRef.current) + 2);
-          const netBusy = transportRef.current.getBufferedAmount() > 524288;
-
-          if (now - lastFrameTime < minInterval || videoEncoder.encodeQueueSize > 2 || netBusy) {
+          if (now - lastFrameTime < minInterval) {
             frame.close();
             continue;
           }
           lastFrameTime = now;
-
-          try {
-            if (videoEncoder.state === 'configured') {
-              const isKey = forceKey || (frameCount % 240 === 0);
-              if (isKey) {
-                forceKey = false;
-                lastKeyframeTs = now;
-              }
-              videoEncoder.encode(frame, { keyFrame: isKey });
-              frameCount++;
-            }
-          } catch (e) {
-          } finally {
-            frame.close();
-          }
+          encodeSingleFrame(frame);
         }
       })().catch(() => {});
+    } else if ('VideoFrame' in window) {
+      hiddenVideo = document.createElement('video');
+      hiddenVideo.muted = true;
+      hiddenVideo.playsInline = true;
+      hiddenVideo.srcObject = new MediaStream([vTrack]);
+      hiddenVideo.play().catch(() => {});
+      fallbackInterval = setInterval(() => {
+        if (!running || !hiddenVideo || hiddenVideo.readyState < 2) return;
+        try {
+          const vf = new VideoFrame(hiddenVideo, { timestamp: performance.now() * 1000 });
+          encodeSingleFrame(vf);
+        } catch (e) {}
+      }, Math.round(1000 / (Number(fpsRef.current) || 30)));
     }
 
     activeEncodersRef.current[streamId] = {
       forceKey: () => {
         const now = performance.now();
-        if (now - lastKeyframeTs > 1500) {
+        if (now - lastKeyframeTs > 250) {
           forceKey = true;
         }
       },
       reconfigure: () => {
-        const st = vTrack.getSettings ? vTrack.getSettings() : {};
-        configureEncoderNow(st.width || 1920, st.height || 1080);
+        createAndConfigureEncoder(usingSoftwareFallback);
       },
       stop: () => {
         running = false;
-        try { if (videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
+        if (fallbackInterval) clearInterval(fallbackInterval);
+        if (hiddenVideo) {
+          try { hiddenVideo.srcObject = null; } catch (e) {}
+        }
+        try { if (videoEncoder && videoEncoder.state !== 'closed') videoEncoder.close(); } catch (e) {}
         try { if (audioEncoder && audioEncoder.state !== 'closed') audioEncoder.close(); } catch (e) {}
       }
     };
@@ -1105,7 +1140,6 @@ export default function App() {
               />
             </div>
 
-            {/* Item 4: Últimas 3 salas abaixo de digitar senha (se não houver nenhuma, não aparece nada) */}
             {recentRooms.length > 0 && (
               <div className="pt-1 space-y-1.5">
                 <span className="block text-[11px] text-gray-400 font-medium">
@@ -1147,7 +1181,6 @@ export default function App() {
 
   return (
     <div className="h-[100dvh] w-screen bg-[#0D0F13] text-[#E2E8F0] flex flex-col overflow-hidden">
-      {/* BARRA SUPERIOR AJUSTADA PARA PC E MOBILE */}
       <header className="min-h-12 bg-[#12151C] border-b border-[#1E232E] px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-1.5 shrink-0 z-20 select-none">
         <div className="flex items-center gap-1.5 sm:gap-2">
           {renderVogelsLogo('text-sm sm:text-base')}
@@ -1173,10 +1206,10 @@ export default function App() {
                 value={bitrateKbps}
                 onChange={e => setBitrateKbps(Number(e.target.value))}
                 className="hidden md:inline-block bg-[#171B24] border border-emerald-500/40 text-xs text-emerald-300 font-semibold rounded-md px-2 py-1.5 cursor-pointer"
-                title="Taxa de Bits Inteligente (VBR)"
+                title="Taxa de Bits (Bitrate)"
               >
                 <option value={2500}>2500 kbps</option>
-                <option value={4000}>4000 kbps (VBR)</option>
+                <option value={4000}>4000 kbps (Ideal)</option>
                 <option value={6000}>6000 kbps</option>
                 <option value={8000}>8000 kbps</option>
               </select>
@@ -1343,11 +1376,11 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Hardware (Placa de Vídeo)</label>
+                  <label className="block text-xs font-medium text-gray-200 mb-1">Codec de Vídeo</label>
                   <select value={codec} onChange={e => setCodec(e.target.value)} className="w-full bg-[#1B202B] border border-[#2B3242] rounded-lg px-2.5 py-2 text-xs text-white">
-                    <option value="H264">H.264 High Profile VBR (NVENC)</option>
+                    <option value="VP8">VP8 Universal (Compatibilidade 100%)</option>
+                    <option value="H264">H.264 Baseline (Hardware)</option>
                     <option value="VP9">VP9 Alta Nitidez</option>
-                    <option value="VP8">VP8 Rápido</option>
                   </select>
                 </div>
               </div>
@@ -1375,7 +1408,6 @@ export default function App() {
         </div>
       </header>
 
-      {/* CORPO PRINCIPAL: EMPILHADO NO MOBILE (flex-col) E LADO A LADO NO DESKTOP (lg:flex-row) */}
       <div className="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
         <main
           className={`bg-[#0B0D11] relative flex flex-col p-2 sm:p-3 overflow-hidden select-none ${
@@ -1460,7 +1492,6 @@ export default function App() {
           </div>
         </main>
 
-        {/* PAINEL DE PARTICIPANTES + CHAT (Responsivo no Mobile e Retrátil) */}
         {!sidebarCollapsed && (
           <aside className="flex-1 lg:flex-none lg:w-72 bg-[#12151C] border-t lg:border-t-0 lg:border-l border-[#1E232E] flex flex-col min-h-0 shrink-0 transition-all">
             <div className="p-2.5 sm:p-3 border-b border-[#1E232E] select-none max-h-28 lg:max-h-48 overflow-y-auto">
@@ -1749,6 +1780,7 @@ function VideoTile({
   const remoteCanvasRef = useRef(null);
   const gainNodeRef = useRef(null);
   const [stats, setStats] = useState({ w: 0, h: 0, fps: 0, kbps: 0 });
+  const [hasFirstFrame, setHasFirstFrame] = useState(Boolean(streamObj.isLocal));
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -1771,7 +1803,6 @@ function VideoTile({
     setControlsVisible(false);
   };
 
-  // Sugestão 2: Toque na tela do vídeo (Mobile/PC) alterna mostrar/ocultar os controles estilo YouTube App
   const handleToggleControlsOnTap = () => {
     setControlsVisible(prev => {
       const next = !prev;
@@ -1784,7 +1815,6 @@ function VideoTile({
     });
   };
 
-  // Sugestão 1: Tela Cheia Nativa (Fullscreen API no PC e Celular)
   const handleToggleFullscreen = async () => {
     try {
       const el = tileRef.current;
@@ -1842,16 +1872,18 @@ function VideoTile({
     localVideoRef.current.play().catch(() => {});
   }, [streamObj.isLocal, streamObj.stream]);
 
+  // Decodificador Remoto com Fallback Automático (Se hardware falhar na GPU do amigo, muda para software sem tela preta!)
   useEffect(() => {
     if (streamObj.isLocal) return;
 
     const canvas = remoteCanvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    const ctx = canvas.getContext('2d', { alpha: false });
 
     let decoder = null;
     let configuredCodec = null;
     let waitingForKey = true;
+    let useSoftwareDecoder = false;
     let lastKeyReqTime = 0;
     let framesRendered = 0;
     let bytesCount = 0;
@@ -1860,13 +1892,13 @@ function VideoTile({
 
     const requestKeyThrottled = () => {
       const now = Date.now();
-      if (now - lastKeyReqTime > 1500) {
+      if (now - lastKeyReqTime > 350) {
         lastKeyReqTime = now;
         onRequestKeyframe?.();
       }
     };
 
-    const initDecoder = (codecStr) => {
+    const initDecoder = (codecStr, forceSoft = false) => {
       try {
         if (decoder && decoder.state !== 'closed') decoder.close();
       } catch (e) {}
@@ -1881,19 +1913,29 @@ function VideoTile({
           currentH = frame.displayHeight;
           ctx.drawImage(frame, 0, 0);
           frame.close();
+          if (framesRendered === 0) setHasFirstFrame(true);
           framesRendered++;
         },
         error: () => {
+          // Se o decodificador de hardware da GPU do espectador falhar, ativa o decodificador de software automaticamente!
+          useSoftwareDecoder = true;
           waitingForKey = true;
           requestKeyThrottled();
         }
       });
 
+      const hwMode = forceSoft || useSoftwareDecoder ? 'prefer-software' : 'no-preference';
       const cfg = codecStr.startsWith('avc1')
-        ? { codec: codecStr, avc: { format: 'annexb' }, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' }
-        : { codec: codecStr, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' };
+        ? { codec: codecStr, avc: { format: 'annexb' }, optimizeForLatency: true, hardwareAcceleration: hwMode }
+        : { codec: codecStr, optimizeForLatency: true, hardwareAcceleration: hwMode };
 
-      decoder.configure(cfg);
+      try {
+        decoder.configure(cfg);
+      } catch (e) {
+        try {
+          decoder.configure({ codec: codecStr, optimizeForLatency: true });
+        } catch (e2) {}
+      }
       configuredCodec = codecStr;
       waitingForKey = true;
     };
@@ -1901,7 +1943,7 @@ function VideoTile({
     videoChunkHandlersRef.current[streamObj.id] = (meta, buffer) => {
       try {
         if (!decoder || decoder.state === 'closed' || configuredCodec !== meta.c) {
-          initDecoder(meta.c || 'vp8');
+          initDecoder(meta.c || 'vp8', useSoftwareDecoder);
         }
         if (waitingForKey) {
           if (meta.t !== 'key') {
@@ -1919,6 +1961,7 @@ function VideoTile({
         });
         decoder.decode(chunk);
       } catch (err) {
+        useSoftwareDecoder = true;
         waitingForKey = true;
         requestKeyThrottled();
       }
@@ -2017,7 +2060,7 @@ function VideoTile({
       if (waitingForKey) {
         requestKeyThrottled();
       }
-    }, 800);
+    }, 450);
 
     const statTimer = setInterval(() => {
       const kbps = Math.round((bytesCount * 8) / 1000);
@@ -2060,13 +2103,19 @@ function VideoTile({
           className="w-full h-full object-contain bg-black"
         />
       ) : (
-        <canvas
-          ref={remoteCanvasRef}
-          className="w-full h-full object-contain bg-black"
-        />
+        <>
+          <canvas
+            ref={remoteCanvasRef}
+            className="w-full h-full object-contain bg-black"
+          />
+          {!hasFirstFrame && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 pointer-events-none">
+              <span className="text-xs text-gray-300 animate-pulse">Sincronizando vídeo de {streamObj.owner}...</span>
+            </div>
+          )}
+        </>
       )}
 
-      {/* Etiqueta Superior (Oculta após 2.5s ou ao tocar na tela) */}
       <div
         onClick={e => e.stopPropagation()}
         className={`absolute top-2.5 left-2.5 z-30 flex items-center gap-2 bg-black/80 px-2.5 py-1 rounded-md border border-white/10 text-[11px] sm:text-xs transition-opacity duration-300 ${
@@ -2082,7 +2131,6 @@ function VideoTile({
         </span>
       </div>
 
-      {/* Barra de Controles Inferior (Responsiva no Mobile + Tela Cheia Nativa) */}
       <div
         onClick={e => e.stopPropagation()}
         className={`absolute bottom-2 right-2 left-2 sm:left-auto z-30 flex flex-wrap items-center justify-end gap-1.5 bg-black/85 px-2 py-1.5 rounded-lg border border-white/10 transition-opacity duration-300 ${
